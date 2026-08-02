@@ -24,6 +24,24 @@ says the Runner is sandboxed, it prefers to leave Codex's sandbox **on**. In ord
 It does **not** branch on Claude Code's `enableWeakerNestedSandbox`. Why the preference inverted,
 and why that setting is irrelevant, is in "Amendment" below.
 
+**Only `/tmp` reaches step 2.** A read-only `$CODEX_HOME` is a hard failure, not a fallback
+trigger: it kills `codex exec` at app-server startup under *every* sandbox mode (probe case B), so
+`danger-full-access` rescues nothing and choosing it would trade the boundary away for a run that
+still cannot start. The Runner checks it first and refuses, naming the path.
+
+**A read-only `/tmp` without an outer sandbox refuses too.** The helper needs `/tmp` whether or not
+anything is nesting, so the precondition is measured independently of the detection probe — but
+what its failure costs is not the same. Sandboxed, the outer jail keeps holding and step 2 trades a
+layer for a Delegation that runs. Unsandboxed there is no other layer, so `danger-full-access` would
+be the only thing standing between a third-party agent and the machine, and the Runner stops
+instead, naming `/tmp`.
+
+**Platform.** The `/tmp` precondition is probed on Linux only, because the obstacle is an
+implementation detail of Codex's Linux sandbox helper. macOS is unmeasured
+([#16](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/16)) and takes the
+preferred path — two enforcing layers is the better guess to hold until it is measured, and it is
+the same "Linux conclusion applied everywhere" this ADR already commits to under "Scope".
+
 ## Original decision, 2026-08-02 — superseded, kept for the failure it documents
 
 *Everything in this section describes what was believed on 2026-08-02. Its central claim —
@@ -90,18 +108,18 @@ outcome the original decision assumed was unavailable: **both sandboxes enforcin
 
 So the rule inverts its preference, to the ordering under "Decision" above.
 
-The Runner's sandbox selection is not implemented yet (`scripts/runner.mjs:11` lists it as
-pending), so nothing is being changed silently. The rule above is the specification it must be
-built to, tracked on
-[#4](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/4).
+The Runner implements this rule as of
+[#4](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/4) — detection by a
+write attempt at `$HOME`, the two preconditions probed and reported separately, and the `-s` mode
+chosen by Delegation Class on both paths.
 
 **Do not put the Workspace under `/tmp`.** Granting `/tmp` hands it to Codex's helper, which mounts
 over paths inside it. During the probe a worktree living under `/tmp` was shadowed by those mounts:
 the Worker wrote its file, reported success truthfully, and the file was absent afterwards — the
-`workspace-write` silent failure exactly reproduced, from an unrelated cause. `scripts/runner.mjs:73`
-currently creates its scratch directory under `tmpdir()`, so this becomes live the moment the
-preferred path is implemented. The Workspace belongs somewhere the inner sandbox does not
-manipulate.
+`workspace-write` silent failure exactly reproduced, from an unrelated cause. The payload directory
+the Runner hands Codex as `-o` now lives under `$CODEX_HOME` instead of `tmpdir()` for that reason. The Workspace belongs somewhere the inner sandbox does not
+manipulate either — that is
+[#9](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/9).
 
 ## Consequences
 

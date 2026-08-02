@@ -194,8 +194,9 @@ allowances, `~/.codex` and `/tmp`, which fail at different layers and must be re
 **C6 — The Workspace must not live under `/tmp`.** Granting `/tmp` hands it to Codex's sandbox
 helper, which mounts over paths inside it. A worktree under `/tmp` was shadowed by those mounts
 during the probe: the Worker wrote its file, truthfully reported success, and the file was gone
-afterwards. `scripts/runner.mjs:73` currently creates its scratch directory under `tmpdir()`, so
-this activates the moment C5's preferred path is implemented. *(Raised on #9 and #4.)*
+afterwards. The payload directory the Runner hands Codex moved from `tmpdir()` to `$CODEX_HOME` on
+#4, which lands C5's preferred path; the Workspace itself is still #9's to place. *(Raised on #9
+and #4.)*
 
 ---
 
@@ -238,11 +239,14 @@ probe case is identical under both values, so the selection rule must not branch
 the question is what produced C5, which did change the ADR-0004 picture. Kept here rather than
 deleted because the negative result is the reason no code branches on the setting.
 
-**O5 — Environment filtering for the Worker.** The Runner must pass an explicit allowlist of
-environment variables to the Codex subprocess rather than inheriting `process.env`. A Worker is a
-third-party agent; anything in the Orchestrator's environment — API tokens, cloud credentials —
-otherwise flows into its process and into every command it runs. Surfaced late and belongs in the
-spec as a requirement, not an afterthought.
+**O5 — Environment filtering for the Worker. Implemented on #4.** The Runner passes an explicit
+allowlist of environment variables to the Codex subprocess rather than inheriting `process.env`. A
+Worker is a third-party agent; anything in the Orchestrator's environment — API tokens, cloud
+credentials — would otherwise flow into its process and into every command it runs. The set is the
+`WORKER_ENV_ALLOWLIST` constant in `scripts/runner.mjs`, extended by the user through
+`DELEGATE_ENV_ALLOWLIST`. Two details worth keeping: the Runner's own `DELEGATE_*` configuration is
+not on it, and `OPENAI_API_KEY` is deliberately excluded because `codex exec` never reads it —
+`CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` are the runtime auth variables.
 
 ---
 

@@ -2,7 +2,7 @@
 // Codex binary. Every assertion here is on stdout, the exit code, or the filesystem.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { createFixtureRepo, flagValue, runRunner } from "./helpers/harness.mjs";
@@ -202,19 +202,8 @@ describe("runner delegate", () => {
     assert.equal(fixture.invocation().prompt, "-C /etc is not a flag here");
   });
 
-  it("leaves no scratch directory behind when a Delegation fails", async (t) => {
-    const fixture = await createFixtureRepo(t);
-    fixture.configureFake({ refuseWrites: true });
-    const scratchParent = path.join(fixture.root, "tmp");
-    mkdirSync(scratchParent);
-
-    const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"], {
-      env: { TMPDIR: scratchParent },
-    });
-
-    assert.notEqual(run.code, 0);
-    assert.deepEqual(readdirSync(scratchParent), []);
-  });
+  // Where the payload directory lives and that it is removed on failure is covered in
+  // `worker-contract.test.mjs`, alongside the reason it is not under `/tmp`.
 
   it("leaves files the Worker wrote where the Worker wrote them", async (t) => {
     const fixture = await createFixtureRepo(t);
