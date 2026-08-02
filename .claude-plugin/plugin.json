@@ -1,0 +1,12 @@
+{
+  "name": "delegate",
+  "description": "Claude Code orchestrates, Codex works. Bounded delegation to a second coding agent, with policy over what is handed out and what is allowed back.",
+  "author": {
+    "name": "aliyusufergin",
+    "url": "https://github.com/aliyusufergin"
+  },
+  "repository": "https://github.com/aliyusufergin/claude-codex-orchestrator-plugin",
+  "license": "Apache-2.0",
+  "keywords": ["codex", "delegation", "orchestration", "review"],
+  "defaultEnabled": false
+}

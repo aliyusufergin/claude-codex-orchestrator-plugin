@@ -1,0 +1,154 @@
+#!/usr/bin/env node
+// Fake Codex binary for the Runner CLI test seam.
+//
+// The Runner resolves the Codex binary from $DELEGATE_CODEX_BIN, so tests point that at this
+// file and get a deterministic, free, offline Codex that can reproduce the transport's
+// pathological cases (stdin hang, stderr noise, success-with-nothing-written).
+//
+// Configuration is read from `fake-codex.json` in $DELEGATE_FAKE_CODEX_DIR, falling back to the
+// process's own working directory. It is deliberately not read from the environment: the Runner
+// will eventually hand the Worker a filtered environment, and the fake has to keep working when
+// it does.
+//
+// Recognised config keys, all optional:
+//   readStdin       read stdin to EOF before doing anything (default true — real `codex exec`
+//                   does this, and it is what hangs forever on an inherited open stdin)
+//   events          array of objects emitted as JSONL on stdout (default: a canned turn)
+//   streamPayload   payload embedded double-encoded in the default stream's agent_message.text
+//   payload         payload written unwrapped to the `-o` file (default {"summary":"ok"})
+//   writePayload    set false to exit successfully having written no payload (probe case C)
+//   writeFiles      { relativePath: contents } written under the `-C` directory
+//   refuseWrites    set true to write nothing at all — no payload, no files — while still
+//                   emitting a stream and exiting with `exitCode`
+//   stderr          text written to stderr
+//   exitCode        process exit code (default 0)
+//
+// Every run records what it saw to `fake-codex-invocation.json` in the same directory:
+// argv, environment, working directory, parsed flags, and how many bytes of stdin it read.
+
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+const VALUE_FLAGS = new Set([
+  "-o",
+  "--output-last-message",
+  "--output-schema",
+  "-C",
+  "--cd",
+  "-c",
+  "--config",
+  "-s",
+  "--sandbox",
+  "-m",
+  "--model",
+  "-p",
+  "--profile",
+  "-i",
+  "--image",
+  "--add-dir",
+]);
+
+const stateDir = process.env.DELEGATE_FAKE_CODEX_DIR ?? process.cwd();
+
+function readConfig() {
+  try {
+    return JSON.parse(readFileSync(path.join(stateDir, "fake-codex.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function parseArgv(argv) {
+  const flags = {};
+  const positionals = [];
+  let onlyPositionals = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (onlyPositionals) {
+      positionals.push(arg);
+    } else if (arg === "--") {
+      // Everything after `--` is a positional, as clap does it.
+      onlyPositionals = true;
+    } else if (VALUE_FLAGS.has(arg)) {
+      const value = argv[++i];
+      if (arg === "-c" || arg === "--config") {
+        (flags.config ??= []).push(value);
+      } else {
+        flags[arg] = value;
+      }
+    } else if (arg.startsWith("-")) {
+      flags[arg] = true;
+    } else {
+      positionals.push(arg);
+    }
+  }
+  return { flags, positionals };
+}
+
+async function readStdinBytes() {
+  let bytes = 0;
+  for await (const chunk of process.stdin) bytes += chunk.length;
+  return bytes;
+}
+
+const config = readConfig();
+const argv = process.argv.slice(2);
+const { flags, positionals } = parseArgv(argv);
+
+const stdinBytes = config.readStdin === false ? null : await readStdinBytes();
+
+writeFileSync(
+  path.join(stateDir, "fake-codex-invocation.json"),
+  `${JSON.stringify(
+    {
+      argv: process.argv,
+      args: argv,
+      flags,
+      positionals,
+      subcommand: positionals[0] ?? null,
+      prompt: positionals.slice(1).join(" ") || null,
+      cwd: process.cwd(),
+      env: process.env,
+      stdinBytes,
+    },
+    null,
+    2,
+  )}\n`,
+);
+
+const payload = config.payload ?? { summary: "ok" };
+const streamPayload = config.streamPayload ?? payload;
+const events = config.events ?? [
+  { type: "thread.started", thread_id: "00000000-0000-4000-8000-000000000000" },
+  { type: "turn.started" },
+  {
+    type: "item.completed",
+    item: { id: "item_0", type: "agent_message", text: JSON.stringify(streamPayload) },
+  },
+  {
+    type: "turn.completed",
+    usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
+  },
+];
+
+for (const event of events) process.stdout.write(`${JSON.stringify(event)}\n`);
+
+const refuseWrites = config.refuseWrites === true;
+
+const workingRoot = flags["-C"] ?? flags["--cd"] ?? process.cwd();
+if (!refuseWrites) {
+  for (const [relative, contents] of Object.entries(config.writeFiles ?? {})) {
+    const target = path.resolve(workingRoot, relative);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, contents);
+  }
+}
+
+const outputFile = flags["-o"] ?? flags["--output-last-message"];
+if (outputFile && !refuseWrites && config.writePayload !== false) {
+  writeFileSync(outputFile, `${JSON.stringify(payload)}\n`);
+}
+
+if (config.stderr) process.stderr.write(config.stderr);
+
+process.exit(config.exitCode ?? 0);
