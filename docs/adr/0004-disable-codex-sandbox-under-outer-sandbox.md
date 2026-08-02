@@ -89,8 +89,16 @@ So the rule inverts its preference, to the ordering under "Decision" above.
 
 The Runner's sandbox selection is not implemented yet (`scripts/runner.mjs:11` lists it as
 pending), so nothing is being changed silently. The rule above is the specification it must be
-built to, tracked as
-[#17](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/17).
+built to, tracked on
+[#4](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/4).
+
+**Do not put the Workspace under `/tmp`.** Granting `/tmp` hands it to Codex's helper, which mounts
+over paths inside it. During the probe a worktree living under `/tmp` was shadowed by those mounts:
+the Worker wrote its file, reported success truthfully, and the file was absent afterwards — the
+`workspace-write` silent failure exactly reproduced, from an unrelated cause. `scripts/runner.mjs:73`
+currently creates its scratch directory under `tmpdir()`, so this becomes live the moment the
+preferred path is implemented. The Workspace belongs somewhere the inner sandbox does not
+manipulate.
 
 ## Consequences
 
