@@ -15,7 +15,7 @@ would live only in a conversation transcript.
 | [`docs/adr/0001`](../adr/0001-independent-runtime-over-codex-exec.md) | Independent runtime over `codex exec` |
 | [`docs/adr/0002`](../adr/0002-autonomous-delegation-bounded-by-budget.md) | Autonomous delegation, bounded by budget |
 | [`docs/adr/0003`](../adr/0003-read-before-change.md) | Read-Before-Change |
-| [`docs/adr/0004`](../adr/0004-disable-codex-sandbox-under-outer-sandbox.md) | Disabling Codex's sandbox under an outer one |
+| [`docs/adr/0004`](../adr/0004-disable-codex-sandbox-under-outer-sandbox.md) | Preferring Codex's own sandbox under an outer one, `danger-full-access` as fallback |
 | [`docs/research/claude-code-orchestrating-codex.md`](../research/claude-code-orchestrating-codex.md) | Both products' extension surfaces, cited |
 | [`docs/research/sandbox-nesting-probe.md`](../research/sandbox-nesting-probe.md) | Measured sandbox behaviour |
 
@@ -118,7 +118,8 @@ finished-and-Landed or untouched. A running Worker is left alone: its Budget is 
 its Result is retrievable next session via `/delegate:result`. Unlanded branches are the user's
 work, not the plugin's litter.
 
-**D23 — Detect an outer sandbox; disable Codex's own when one is present.** → ADR-0004
+**D23 — Detect an outer sandbox; keep Codex's own on where the preconditions allow.** → ADR-0004
+*(Originally "disable Codex's own when one is present". Reversed 2026-08-03 — see C5.)*
 
 ---
 
@@ -179,6 +180,23 @@ advance.
 Orchestrator-side reasoning level and should be low — it is a dumb shell. Codex's effort is
 `-c model_reasoning_effort` from the Runner's table (D16). Do not conflate them.
 
+**C5 — D23 was backwards: nesting works, given a writable `/tmp`.** The nesting failure was never
+Codex's Landlock layer. Codex's Linux sandbox is itself bubblewrap-based, and its helper builds
+synthetic mount targets under `/tmp`; Claude Code leaves `/tmp` read-only, so the helper panics
+before enforcing anything — while reporting each command as denied with exit code `0`, which is
+how a crash came to be read as a policy denial. Grant `/tmp` and both sandboxes enforce at once.
+So `danger-full-access` is the **fallback**, not the rule: prefer `read-only` for Advisory and
+`workspace-write` for Verifiable, exactly as in the unsandboxed case, and fall back only when
+`/tmp` or `$CODEX_HOME` is not writable — naming which. Sandboxed users need **two** write
+allowances, `~/.codex` and `/tmp`, which fail at different layers and must be reported separately.
+*(Folded into ADR-0004 and D23; acceptance criteria corrected on #4 and #13.)*
+
+**C6 — The Workspace must not live under `/tmp`.** Granting `/tmp` hands it to Codex's sandbox
+helper, which mounts over paths inside it. A worktree under `/tmp` was shadowed by those mounts
+during the probe: the Worker wrote its file, truthfully reported success, and the file was gone
+afterwards. `scripts/runner.mjs:73` currently creates its scratch directory under `tmpdir()`, so
+this activates the moment C5's preferred path is implemented. *(Raised on #9 and #4.)*
+
 ---
 
 ## Transport facts the implementation must respect
@@ -201,7 +219,10 @@ All measured, not assumed. Detail in the research documents.
 ## Open — carried into the spec, none blocking
 
 **O1 — macOS.** ADR-0004 is verified on Linux only. Seatbelt-inside-Seatbelt is untested and needs
-a separate machine.
+a separate machine. C5 widens the gap rather than narrowing it: the Linux cause is an
+implementation detail of Codex's Linux sandbox helper and does not transfer to Seatbelt at all, so
+macOS needs the general question asked afresh — does Codex's macOS sandbox need any writable path
+Claude Code denies? Open as #16.
 
 **O2 — Network under an outer sandbox.** Claude Code pre-allows no domains, so a sandboxed user may
 need the OpenAI API host in `sandbox.network.allowedDomains`. Untested.
@@ -209,8 +230,11 @@ need the OpenAI API host in `sandbox.network.allowedDomains`. Untested.
 **O3 — Numeric defaults.** Budget ceiling per window, dedup TTL, and the diff-size threshold above
 which the Orchestrator stops reading and asks. To be calibrated, not guessed.
 
-**O4 — `enableWeakerNestedSandbox`.** Whether Claude Code's own nested-sandbox escape hatch changes
-the ADR-0004 picture.
+**O4 — `enableWeakerNestedSandbox`. Answered 2026-08-03: no.** It swaps a namespace-scoped procfs
+for a bind of the host `/proc` and drops `--cap-drop ALL` — neither is what Codex needs. Every
+probe case is identical under both values, so the selection rule must not branch on it. Chasing
+the question is what produced C5, which did change the ADR-0004 picture. Kept here rather than
+deleted because the negative result is the reason no code branches on the setting.
 
 **O5 — Environment filtering for the Worker.** The Runner must pass an explicit allowlist of
 environment variables to the Codex subprocess rather than inheriting `process.env`. A Worker is a
