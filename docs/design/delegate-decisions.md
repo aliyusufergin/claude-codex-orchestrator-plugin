@@ -225,7 +225,9 @@ macOS needs the general question asked afresh — does Codex's macOS sandbox nee
 Claude Code denies? Open as #16.
 
 **O2 — Network under an outer sandbox.** Claude Code pre-allows no domains, so a sandboxed user may
-need the OpenAI API host in `sandbox.network.allowedDomains`. Untested.
+need the OpenAI API host in `sandbox.network.allowedDomains`. Untested — both probe runs shared the
+host network, because both reconstructed the outer sandbox rather than running under a real one.
+Answering it is part of #16's Linux half, which needs no special hardware.
 
 **O3 — Numeric defaults.** Budget ceiling per window, dedup TTL, and the diff-size threshold above
 which the Orchestrator stops reading and asks. To be calibrated, not guessed.
