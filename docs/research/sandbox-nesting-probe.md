@@ -243,7 +243,11 @@ plugin does about it.
   Codex's helper needs.
 - **A genuinely sandboxed Claude Code session.** Both runs reconstruct the outer sandbox by hand
   from Claude Code's own argument set rather than enabling its sandbox and delegating from inside
-  it. The arguments match, but the reconstruction is not the product.
+  it. The arguments match, but the reconstruction is not the product — the network isolation above
+  and Claude Code's seccomp layer (absent on this machine, so never applied) both sit outside it.
+  This is the Linux half of
+  [#16](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/16), and unlike
+  the macOS half it needs no hardware anyone lacks.
 
 ## Reproducing
 

@@ -58,8 +58,11 @@ measured, this ADR's rule is a Linux conclusion applied everywhere by default.
 **Reconstructed, not observed.** Neither run enabled Claude Code's sandbox and delegated from
 inside it. Both rebuilt the outer sandbox by hand from Claude Code 2.1.220's own `bwrap` argument
 set — run 2 matching it exactly, including the branch this ADR's amendment turns on. The arguments
-are right, but a reconstruction is not the product: anything Claude Code does outside that argv,
-network isolation included, is unmeasured. Weigh the rule accordingly.
+are right, but a reconstruction is not the product: anything Claude Code does outside that argv is
+unmeasured — network isolation especially, and the seccomp layer that was absent on the probe
+machine. Verifying this against a real sandbox is the Linux half of
+[#16](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/16), which needs no
+special hardware. Weigh the rule accordingly until it lands.
 
 ## Amendment — the obstacle is a read-only `/tmp`
 
