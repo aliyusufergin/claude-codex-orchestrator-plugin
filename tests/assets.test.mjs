@@ -173,6 +173,32 @@ describe("commands", () => {
   });
 });
 
+describe("/delegate:quota", () => {
+  const { frontmatter, body } = readAsset("commands", "quota.md");
+
+  it("is the user's command, not the model's", () => {
+    // Raising the ceiling is the one place the bound of ADR-0002 is negotiable, and an
+    // Orchestrator that could invoke this would be negotiating with itself.
+    assert.equal(frontmatter["disable-model-invocation"], "true");
+    assert.ok(frontmatter["argument-hint"], "a command taking a ceiling says so");
+    assert.match(body, /runner\.mjs" quota/);
+  });
+
+  it("carries no ceiling, window or TTL of its own", () => {
+    // The numbers live in `scripts/config.mjs` and are enforced in the Runner. A command prompt
+    // that named one would be a second copy of the bound, and the wrong one.
+    for (const flag of ["DELEGATE_BUDGET_CEILING", "DELEGATE_DEDUP_TTL", "--ceiling"]) {
+      assert.ok(!body.includes(flag), `the command carries ${flag}`);
+    }
+  });
+
+  it("tells the Orchestrator not to raise the ceiling or route around the Budget", () => {
+    assert.match(body, /negotiable by the user/i);
+    assert.match(body, /do not raise the ceiling/i);
+    assert.match(body, /do not suggest working around the Budget/i);
+  });
+});
+
 describe("prompt templates", () => {
   for (const file of walk(path.join(REPO_ROOT, "prompts"))) {
     it(`${path.relative(REPO_ROOT, file)} has exactly one place for the request`, () => {

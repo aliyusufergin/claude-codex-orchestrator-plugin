@@ -105,6 +105,20 @@ passes `--kind` and the Runner resolves the rest.
 Orchestrator. Budget counted at Delegation start. Rejected: a concurrency cap, and
 visibility-only. → ADR-0002
 
+*Implemented on #7.* The Budget is a count over an append-only **Ledger** of Delegation starts,
+appended immediately before the spawn and never rewritten — which is what makes counting at start
+safe under concurrency without a lock file that could outlive a killed Runner and refuse everything
+after it. The Ledger is bounded by *rotation*, not compaction, for the same reason: a
+truncate-and-rewrite would drop a start record a second Runner was appending at that moment, and
+the Budget would under-count exactly when it is most loaded. Two Delegations starting in the same instant can both read a count below the ceiling, so
+the bound is one-over at worst; the alternative was judged worse. A ledger that cannot be written
+refuses the Delegation rather than proceeding uncounted: the Budget *is* the ledger, and running
+unbounded is the outcome ADR-0002 exists to prevent. Refusal is exit `1` with the count, the
+ceiling, the moment the window frees up, and `/delegate:quota` named — the Runner cannot ask,
+because `AskUserQuestion` is unavailable to every subagent, so everything the user needs to decide
+has to be in the refusal itself. Order in the Runner is dedup, then Budget, then the preconditions
+for running Codex at all: serving a cached Result needs no Worker, and neither does refusing.
+
 **D12 — Advisory blocks, Verifiable does not.** Advisory is short and its whole value is the answer
 returning to the flow. Verifiable runs for minutes and its result is a branch, so it runs in the
 background and reports on completion.
@@ -159,6 +173,13 @@ including under an outer sandbox where `$HOME` is not. Persisting is best-effort
 the Result is validated or rendered, and a directory that cannot be written to costs
 `/delegate:result`, never the answer — the Budget for it is already spent.
 
+*Widened on #7.* The same root now holds the whole of the plugin's state: `results/`, the Budget
+`ledger.jsonl`, `settings.json`, and `dedup/<repo>/` — all of it outside any repository, which the
+Budget requires (it is the provider's, and the provider does not care which repository a Delegation
+came from) and which keeps a Worker's Result out of the user's source tree. Only the dedup cache is
+partitioned by repository, and it is partitioned by the hash of the repository's toplevel, not by
+living inside it.
+
 **D21 — A Stale Workspace cannot be Landed autonomously.** The Runner records the `HEAD` and a hash
 of the uncommitted state it seeded from and compares at Landing time. → ADR-0003
 
@@ -202,6 +223,29 @@ they would; D16 and D20 moved all three into the Runner. Agents pass `--kind` on
 **C3 — The dedup key is `(Task Kind + prompt + HEAD + thread_id)`.** Without `thread_id` a repeated
 follow-up on a resumed Advisory thread would be served from cache and the thread would never
 advance.
+
+*Implemented on #7, with one consequence worth stating.* `HEAD` is the only thing about the tree in
+the key, so a Delegation repeated against the same commit with different **uncommitted** work in it
+hashes the same and is served from cache — and reviewing an uncommitted diff is the plugin's first
+use. The dedup TTL is the only guard, which is why it defaults to 15 minutes and why a cache hit
+reports how old its Result is and says plainly that a changed working tree makes it stale. The
+`--thread` flag exists on `delegate` today only to feed this key; resuming a thread with it is #8's.
+Widening the key with a hash of the uncommitted state is the obvious alternative and was left to
+#8 deliberately: that is where `thread_id` stops being a placeholder, so the key is edited once
+rather than twice. D21 needs the same measurement for a different comparison — the hash of what a
+Workspace was *seeded* from, compared at Landing time, against this one's hash of the tree as it is
+now — so #10 reuses #8's helper rather than writing a second one.
+Entries are repo-scoped — an identical prompt at an identical `HEAD` in another repository is a
+different question — and only a Result the Runner was willing to render is cached; a failed
+Delegation is one to run again, not one to serve again.
+
+Two further narrowings, both deliberate. Only **Advisory** Results are cached: a Verifiable Result
+names a branch in a **Workspace**, and D22 sweeps Workspaces, so serving one a second time would
+point the Orchestrator at work that may already have been Landed or collected — worse than spending
+the Delegation. #9 decides what dedup means once a Workspace exists. And the cache hit announces
+itself on **stdout**, not stderr: a Forwarder returns stdout verbatim and reads stderr only when the
+Runner exits non-zero, so the notice that a Result is *n* minutes old would otherwise reach nobody
+at all — which, given the uncommitted-work caveat above, is the disclosure that matters most.
 
 **C4 — Two different `effort` settings exist.** The Forwarder's frontmatter `effort` is the
 Orchestrator-side reasoning level and should be low — it is a dumb shell. Codex's effort is
@@ -280,6 +324,24 @@ Answering it is part of #16's Linux half, which needs no special hardware.
 
 **O3 — Numeric defaults.** Budget ceiling per window, dedup TTL, and the diff-size threshold above
 which the Orchestrator stops reading and asks. To be calibrated, not guessed.
+
+*Still open on #7, but no longer scattered.* All four numbers live in `scripts/config.mjs` and
+nowhere else, each overridable by an environment variable and by `settings.json` in the state
+directory, the environment winning:
+
+| Setting | Default | Environment |
+| :-- | :-- | :-- |
+| Delegations per window | 20 | `DELEGATE_BUDGET_CEILING` |
+| Rolling window | 5h | `DELEGATE_BUDGET_WINDOW_HOURS` |
+| Dedup TTL | 15m | `DELEGATE_DEDUP_TTL_MINUTES` |
+| Diff read threshold | 400 lines | `DELEGATE_DIFF_MAX_LINES` |
+
+Every one of them is a placeholder. The window is the shape the Worker's provider enforces rather
+than a measurement of it; the ceiling is a guess at how many Delegations fit in one; the TTL is set
+by how long a working tree stays recognisable, not by data; the threshold has no consumer yet —
+Landing is #10's. `/delegate:quota` prints all four with where each came from and says they are
+provisional, and the Ledger records what closing this needs: Delegation counts per window,
+durations, and diff sizes.
 
 **O4 — `enableWeakerNestedSandbox`. Answered 2026-08-03: no.** It swaps a namespace-scoped procfs
 for a bind of the host `/proc` and drops `--cap-drop ALL` — neither is what Codex needs. Every

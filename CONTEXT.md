@@ -60,6 +60,12 @@ Worker's own provider enforces. Finite and unreplenishable within the window, so
 repeated or worthless Delegations denies it to valuable ones later.
 _Avoid_: quota, rate limit, credits
 
+**Ledger**:
+The append-only record of every Delegation started, served from cache, and finished. It is what
+the Budget is counted from — so a Budget that cannot be written cannot be enforced — and it is
+where the observations calibration needs are kept: counts per window, durations, diff sizes.
+_Avoid_: log, history, audit trail
+
 ### Task Kinds
 
 **Review**:

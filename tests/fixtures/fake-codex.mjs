@@ -30,9 +30,11 @@
 //   exitCode        process exit code (default 0)
 //
 // Every run records what it saw to `fake-codex-invocation.json` in the same directory:
-// argv, environment, working directory, parsed flags, and how many bytes of stdin it read.
+// argv, environment, working directory, parsed flags, and how many bytes of stdin it read. The
+// same record is appended to `fake-codex-invocations.jsonl`, so that a test about dedup can ask
+// how many times Codex was invoked rather than only what the last invocation looked like.
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const VALUE_FLAGS = new Set([
@@ -103,23 +105,25 @@ const { flags, positionals } = parseArgv(argv);
 
 const stdinBytes = config.readStdin === false ? null : await readStdinBytes();
 
+const invocation = {
+  argv: process.argv,
+  args: argv,
+  flags,
+  positionals,
+  subcommand: positionals[0] ?? null,
+  prompt: positionals.slice(1).join(" ") || null,
+  cwd: process.cwd(),
+  env: process.env,
+  stdinBytes,
+};
+
 writeFileSync(
   path.join(stateDir, "fake-codex-invocation.json"),
-  `${JSON.stringify(
-    {
-      argv: process.argv,
-      args: argv,
-      flags,
-      positionals,
-      subcommand: positionals[0] ?? null,
-      prompt: positionals.slice(1).join(" ") || null,
-      cwd: process.cwd(),
-      env: process.env,
-      stdinBytes,
-    },
-    null,
-    2,
-  )}\n`,
+  `${JSON.stringify(invocation, null, 2)}\n`,
+);
+appendFileSync(
+  path.join(stateDir, "fake-codex-invocations.jsonl"),
+  `${JSON.stringify(invocation)}\n`,
 );
 
 const DEFAULT_PAYLOAD = {

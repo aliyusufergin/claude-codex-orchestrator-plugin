@@ -24,7 +24,7 @@ export const FAKE_CODEX = path.join(REPO_ROOT, "tests", "fixtures", "fake-codex.
 
 const RUN_TIMEOUT_MS = 10_000;
 
-function git(cwd, args) {
+export function git(cwd, args) {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd, stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
@@ -37,6 +37,27 @@ function git(cwd, args) {
       else reject(new Error(`git ${args.join(" ")} failed (${code}): ${stderr}`));
     });
   });
+}
+
+/** One JSONL file's records, oldest first — the Budget ledger and the fake's invocation log. */
+function readJsonl(file) {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line));
+}
+
+/** A git repository with one commit, at `dir`. */
+async function initRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "README.md"), "# fixture\n");
+  await git(dir, ["init", "-b", "main"]);
+  await git(dir, ["config", "user.email", "test@example.com"]);
+  await git(dir, ["config", "user.name", "test"]);
+  await git(dir, ["add", "."]);
+  await git(dir, ["commit", "-m", "initial"]);
+  return dir;
 }
 
 /**
@@ -56,17 +77,10 @@ export async function createFixtureRepo(t) {
   // default reads `$CLAUDE_PLUGIN_DATA` — which is set for real in the session these tests are
   // written in, and would put fixture Results in the developer's own plugin data directory.
   const stateDir = path.join(root, "state");
-  mkdirSync(repo);
   mkdirSync(fakeDir);
   mkdirSync(codexHome);
   mkdirSync(tmpProbe);
-
-  writeFileSync(path.join(repo, "README.md"), "# fixture\n");
-  await git(repo, ["init", "-b", "main"]);
-  await git(repo, ["config", "user.email", "test@example.com"]);
-  await git(repo, ["config", "user.name", "test"]);
-  await git(repo, ["add", "."]);
-  await git(repo, ["commit", "-m", "initial"]);
+  await initRepo(repo);
 
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
@@ -85,11 +99,23 @@ export async function createFixtureRepo(t) {
         JSON.parse(readFileSync(path.join(dir, entry), "utf8")),
       );
     },
+    /** Every entry the Runner appended to the Budget ledger, oldest first. */
+    ledger() {
+      return readJsonl(path.join(stateDir, "ledger.jsonl"));
+    },
+    /** A second git repository beside the first, for the tests about repo scoping. */
+    async addRepo(name) {
+      return initRepo(path.join(root, name));
+    },
     configureFake(config) {
       writeFileSync(path.join(fakeDir, "fake-codex.json"), `${JSON.stringify(config, null, 2)}\n`);
     },
     invocation() {
       return JSON.parse(readFileSync(path.join(fakeDir, "fake-codex-invocation.json"), "utf8"));
+    },
+    /** Every invocation of the fake so far — how a dedup test asks whether Codex ran at all. */
+    invocations() {
+      return readJsonl(path.join(fakeDir, "fake-codex-invocations.jsonl"));
     },
   };
 }
