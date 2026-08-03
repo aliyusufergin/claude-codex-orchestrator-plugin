@@ -21,6 +21,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/runner.mjs" delegate --kind review --prompt 
 DELEGATE_PROMPT
 ```
 
+If the request itself contains `DELEGATE_PROMPT` alone on a line, the heredoc ends there and the
+rest of the request is lost — pick a delimiter the request does not contain and use that instead.
+
 Pass the request through unchanged. It is the only thing that travels: the prompt template, the
 output schema, the reasoning effort and the sandbox mode all live in the Runner, and `--kind review`
 is what selects them. Never pass a model, an effort, a schema or a sandbox flag of your own.
