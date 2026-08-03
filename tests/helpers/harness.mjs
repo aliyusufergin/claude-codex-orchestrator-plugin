@@ -3,7 +3,15 @@
 // never on the Runner's internals.
 
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +52,10 @@ export async function createFixtureRepo(t) {
   // preconditions are measured against directories a test owns rather than the machine's.
   const codexHome = path.join(root, "codex-home");
   const tmpProbe = path.join(root, "tmp-probe");
+  // Where persisted Results land. Fixed by the fixture rather than left to default, because the
+  // default reads `$CLAUDE_PLUGIN_DATA` — which is set for real in the session these tests are
+  // written in, and would put fixture Results in the developer's own plugin data directory.
+  const stateDir = path.join(root, "state");
   mkdirSync(repo);
   mkdirSync(fakeDir);
   mkdirSync(codexHome);
@@ -64,6 +76,15 @@ export async function createFixtureRepo(t) {
     fakeDir,
     codexHome,
     tmpProbe,
+    stateDir,
+    /** Every persisted Result, newest first is not promised — there is one per Delegation. */
+    persistedResults() {
+      const dir = path.join(stateDir, "results");
+      if (!existsSync(dir)) return [];
+      return readdirSync(dir).map((entry) =>
+        JSON.parse(readFileSync(path.join(dir, entry), "utf8")),
+      );
+    },
     configureFake(config) {
       writeFileSync(path.join(fakeDir, "fake-codex.json"), `${JSON.stringify(config, null, 2)}\n`);
     },
@@ -90,6 +111,7 @@ export function runRunner(fixture, args, options = {}) {
       DELEGATE_CODEX_BIN: FAKE_CODEX,
       DELEGATE_FAKE_CODEX_DIR: fixture.fakeDir,
       CODEX_HOME: fixture.codexHome,
+      DELEGATE_STATE_DIR: fixture.stateDir,
       // Sandbox detection is a measurement of the machine the tests run on, so it is forced off
       // by default and turned on explicitly by the tests that are about it.
       DELEGATE_SANDBOXED: "0",
@@ -135,6 +157,38 @@ export function runRunner(fixture, args, options = {}) {
       resolve({ code, signal, stdout, stderr, timedOut });
     });
   });
+}
+
+/** One schema-conforming Advisory finding, with the fields a test cares about overridden. */
+export function advisoryFinding(overrides = {}) {
+  return {
+    severity: "high",
+    title: "Token expiry is compared with the wrong operator",
+    body: "A token expiring exactly now is treated as valid, so the refresh never fires.",
+    file: "src/auth/token.ts",
+    line_start: 44,
+    line_end: 45,
+    evidence: "if (expiresAt < Date.now()) {\n  return refresh(token);\n}",
+    confidence: 0.8,
+    recommendation: "Compare with `<=`, and cover the boundary with a test.",
+    ...overrides,
+  };
+}
+
+/** One schema-conforming Advisory Result, with the fields a test cares about overridden. */
+export function advisoryPayload(overrides = {}) {
+  return {
+    verdict: "concerns",
+    summary: "Read the diff and the callers it touches. One boundary bug, nothing structural.",
+    findings: [advisoryFinding()],
+    next_steps: ["Run the auth suite once the operator is fixed."],
+    ...overrides,
+  };
+}
+
+/** The Result id out of a rendered Advisory Result. */
+export function resultId(stdout) {
+  return stdout.match(/Result `([a-z]+-[0-9a-f]{8})`/)?.[1];
 }
 
 /** The value passed to a flag in the fake's recorded argv, or undefined. */
