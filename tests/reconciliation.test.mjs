@@ -253,7 +253,10 @@ describe("event-stream reconciliation", () => {
     const run = await runRunner(fixture, ["delegate", "--kind", "implementation", "--prompt", "fix it"]);
 
     assert.notEqual(run.code, 0, "a Verifiable Delegation that wrote nothing was reported as done");
-    assert.equal(run.stdout, "");
+    // Stdout carries the Delegation's id, announced before the work began (D12), and nothing else:
+    // no Result was rendered, so there is nothing for the Orchestrator to mistake for one.
+    assert.match(run.stdout, /Delegation `implementation-[0-9a-f]{8}` started/);
+    assert.doesNotMatch(run.stdout, /## Implementation/);
     assert.match(run.stderr, /patch rejected/);
   });
 

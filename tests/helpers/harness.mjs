@@ -39,6 +39,25 @@ export function git(cwd, args) {
   });
 }
 
+/** One `git` question, answered with its trimmed stdout. Rejects on a non-zero exit. */
+export function gitStdout(cwd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0 ? resolve(stdout.trim()) : reject(new Error(`git ${args.join(" ")} failed: ${stderr}`)),
+    );
+  });
+}
+
 /** One JSONL file's records, oldest first — the Budget ledger and the fake's invocation log. */
 function readJsonl(file) {
   if (!existsSync(file)) return [];
@@ -102,6 +121,20 @@ export async function createFixtureRepo(t) {
     /** Every entry the Runner appended to the Budget ledger, oldest first. */
     ledger() {
       return readJsonl(path.join(stateDir, "ledger.jsonl"));
+    },
+    /** The Workspaces the Runner created and has not removed, by Delegation id. */
+    workspaces() {
+      const dir = path.join(stateDir, "workspaces");
+      if (!existsSync(dir)) return [];
+      return readdirSync(dir).sort();
+    },
+    /** The live-Delegation records `/delegate:status` reads and `/delegate:cancel` signals. */
+    running() {
+      const dir = path.join(stateDir, "running");
+      if (!existsSync(dir)) return [];
+      return readdirSync(dir).map((entry) =>
+        JSON.parse(readFileSync(path.join(dir, entry), "utf8")),
+      );
     },
     /** A second git repository beside the first, for the tests about repo scoping. */
     async addRepo(name) {
@@ -208,6 +241,20 @@ export function advisoryPayload(overrides = {}) {
     summary: "Read the diff and the callers it touches. One boundary bug, nothing structural.",
     findings: [advisoryFinding()],
     next_steps: ["Run the auth suite once the operator is fixed."],
+    ...overrides,
+  };
+}
+
+/** One schema-conforming Verifiable Result, with the fields a test cares about overridden. */
+export function verifiablePayload(overrides = {}) {
+  return {
+    summary: "Added the boundary check and covered it with a test.",
+    branch: "delegate/implementation-00000000",
+    files_changed: ["src/auth/token.ts"],
+    diff_stat: { files: 1, insertions: 12, deletions: 3 },
+    verification: { command: "npm test", exit_code: 0, passed: true },
+    caveats: ["The integration suite was not run."],
+    expected_failure: null,
     ...overrides,
   };
 }

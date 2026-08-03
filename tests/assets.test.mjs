@@ -1,6 +1,6 @@
 // Seam 2 — the asset lint. The shipped markdown and JSON never pass through the Runner, so
 // nothing else notices when they break. This lint grows one assertion per shipped asset; today
-// the plugin ships a manifest, two output schemas, three Forwarders, two commands and three prompt
+// the plugin ships a manifest, two output schemas, four Forwarders, four commands and four prompt
 // templates.
 
 import assert from "node:assert/strict";
@@ -101,6 +101,25 @@ describe("output schemas", () => {
     });
   }
 
+  it("makes the Verification Signal mandatory on every Verifiable Result", () => {
+    const schema = JSON.parse(readFileSync(path.join(REPO_ROOT, "schemas", "verifiable.json"), "utf8"));
+
+    // The Class is defined by carrying a mechanical pass/fail signal (D3). A Result that can omit
+    // one is an Advisory Result with a diff attached, and nothing downstream would notice.
+    assert.ok(schema.required.includes("verification"), "verification is optional");
+    const signal = schema.properties.verification;
+    for (const field of ["command", "exit_code", "passed"]) {
+      assert.ok(signal.required.includes(field), `${field} is optional`);
+    }
+    assert.equal(signal.properties.passed.type, "boolean");
+    // The command has to be one a reader can run again, which a description of it is not.
+    assert.equal(signal.properties.command.minLength, 1);
+    // C1: Repro's signal is inverted, and the field that says so has to be representable without a
+    // Worker being able to leave it out.
+    assert.ok(schema.required.includes("expected_failure"));
+    assert.deepEqual(schema.properties.expected_failure.type, ["boolean", "null"]);
+  });
+
   it("makes evidence mandatory on every Advisory finding", () => {
     const schema = JSON.parse(readFileSync(path.join(REPO_ROOT, "schemas", "advisory.json"), "utf8"));
     const finding = schema.properties.findings.items;
@@ -114,10 +133,15 @@ describe("output schemas", () => {
   });
 });
 
-/** The three Advisory Task Kinds. Verifiable's Forwarders arrive with the Workspace on #9. */
+/** The three Advisory Task Kinds. */
 const ADVISORY_KINDS = ["review", "diagnosis", "adversarial"];
 
-for (const kind of ADVISORY_KINDS) {
+/** The Verifiable Task Kinds that ship a Forwarder. Repro and Migration follow Implementation. */
+const VERIFIABLE_KINDS = ["implementation"];
+
+for (const kind of [...ADVISORY_KINDS, ...VERIFIABLE_KINDS]) {
+  const advisory = ADVISORY_KINDS.includes(kind);
+
   describe(`the ${kind} Forwarder`, () => {
     const { frontmatter, body } = readAsset("agents", `${kind}.md`);
 
@@ -156,11 +180,34 @@ for (const kind of ADVISORY_KINDS) {
       }
     });
 
-    it("knows how to continue a thread rather than paying for a fresh Delegation", () => {
-      // D11. Without this the thread id in a Result reaches an Orchestrator with nothing to do
-      // with it, and every follow-up costs a whole Delegation.
-      assert.match(body, /--thread/);
-    });
+    if (advisory) {
+      it("knows how to continue a thread rather than paying for a fresh Delegation", () => {
+        // D11. Without this the thread id in a Result reaches an Orchestrator with nothing to do
+        // with it, and every follow-up costs a whole Delegation.
+        assert.match(body, /--thread/);
+      });
+    } else {
+      it("never passes a thread, because a Verifiable Delegation always starts clean", () => {
+        // D11's other half, and the Runner refuses `--thread` on a Verifiable Kind outright — so a
+        // Forwarder that passed one would turn every Delegation into a usage error.
+        assert.ok(!body.includes("--thread"), "a Verifiable Forwarder offers to resume a thread");
+      });
+
+      it("starts the Delegation in the background rather than waiting for it", () => {
+        // D12: Verifiable runs for minutes and its Result is a branch. A Forwarder that blocked on
+        // it would hold the session for the whole run, which is the cost delegating exists to avoid.
+        assert.match(body, /background/i);
+        assert.match(body, /do not wait/i);
+      });
+
+      it("does not describe a Result that does not exist yet", () => {
+        // The failure mode of a non-blocking Delegation: the Forwarder returns before the Worker
+        // has finished, and anything it says about the change is invention.
+        assert.match(body, /do not invent a Result/i);
+        assert.match(body, /\/delegate:status/);
+        assert.match(body, /\/delegate:result/);
+      });
+    }
 
     it("returns the Runner's stdout verbatim", () => {
       assert.match(body, /verbatim/i);
@@ -209,6 +256,45 @@ describe("commands", () => {
   });
 });
 
+describe("/delegate:status", () => {
+  const { frontmatter, body } = readAsset("commands", "status.md");
+
+  it("is the user's command, not the model's", () => {
+    assert.equal(frontmatter["disable-model-invocation"], "true");
+    assert.match(body, /runner\.mjs" status/);
+  });
+
+  it("tells the Orchestrator not to inspect a Delegation that has not finished", () => {
+    // A running Verifiable Delegation has a Workspace and no Result. An Orchestrator that read the
+    // Workspace would be reporting a half-written change as an answer.
+    assert.match(body, /do not read a Workspace/i);
+    assert.match(body, /\/delegate:result/);
+  });
+});
+
+describe("/delegate:cancel", () => {
+  const { frontmatter, body } = readAsset("commands", "cancel.md");
+
+  it("is the user's command, not the model's", () => {
+    assert.equal(frontmatter["disable-model-invocation"], "true");
+    assert.ok(frontmatter["argument-hint"], "a command taking an id says so");
+    assert.match(body, /runner\.mjs" cancel/);
+  });
+
+  it("says the Budget is spent either way, and does not offer to route around it", () => {
+    // The Budget counts what was asked of the provider (ADR-0002), and a cancelled Delegation asked.
+    // An Orchestrator that read cancelling as a refund would retry until the ceiling was reached.
+    assert.match(body, /still counts against the Delegation Budget/i);
+    assert.match(body, /do not suggest raising the ceiling/i);
+  });
+
+  it("tells the Orchestrator not to answer in the cancelled Delegation's place", () => {
+    // D14's first guardrail, in the one case where the Delegation was stopped on purpose.
+    assert.match(body, /produced no Result/i);
+    assert.match(body, /do not do\s+the work yourself/i);
+  });
+});
+
 describe("/delegate:quota", () => {
   const { frontmatter, body } = readAsset("commands", "quota.md");
 
@@ -243,13 +329,41 @@ describe("prompt templates", () => {
     });
   }
 
-  for (const kind of ADVISORY_KINDS) {
+  for (const kind of [...ADVISORY_KINDS, ...VERIFIABLE_KINDS]) {
     it(`ships one for ${kind}`, () => {
       // A Task Kind with no template still runs — the Runner sends the request on its own and says
       // so — which is exactly the silent-ish degradation this lint exists to catch before release.
       assert.ok(existsSync(path.join(REPO_ROOT, "prompts", `${kind}.md`)));
     });
   }
+
+  it("tells every Verifiable Worker where it is and that it produces its own signal", () => {
+    for (const kind of VERIFIABLE_KINDS) {
+      const template = readFileSync(path.join(REPO_ROOT, "prompts", `${kind}.md`), "utf8");
+      // D5: a Worker that thinks it is in the user's checkout will reach outside the Workspace for
+      // the uncommitted work that is already under its feet.
+      assert.match(template, /Workspace/, `${kind} does not say where it is`);
+      assert.match(template, /not their working tree/i, `${kind} does not say whose tree it is in`);
+      // D6: the Runner never re-runs the command, so a Worker that does not run one leaves the
+      // Result with no signal at all — and the Runner then fails it, having spent the Budget.
+      assert.match(template, /run it again/i, `${kind} does not ask for iteration against the signal`);
+      assert.match(template, /verification\.command/, `${kind} never says what to report`);
+    }
+  });
+
+  it("tells the Implementation Worker not to weaken the test it is verifying against", () => {
+    // The one way a Verification Signal lies without anybody lying: the Worker makes the command
+    // pass by changing what the command checks. Nothing downstream can tell that from a real pass.
+    const template = readFileSync(path.join(REPO_ROOT, "prompts", "implementation.md"), "utf8");
+    assert.match(template, /weakened, skipped, or deleted/i);
+  });
+
+  it("frames Implementation by intent rather than by mechanism", () => {
+    // D3's definition of the Kind, and the reason it is worth delegating at all: a request that
+    // named the lines to edit would be cheaper to carry out than to write down.
+    const template = readFileSync(path.join(REPO_ROOT, "prompts", "implementation.md"), "utf8");
+    assert.match(template, /outcome, not a patch/i);
+  });
 
   it("tells every Advisory Worker that it changes nothing and that evidence is verbatim", () => {
     // Both are load-bearing beyond the individual Kind: `read-only` is what the Class asks Codex

@@ -17,9 +17,12 @@
 //   streamPayload   payload embedded double-encoded in the default stream's agent_message.text
 //   streamTail      text written to stdout after the events, verbatim and with no trailing
 //                   newline — for a stream cut off mid-record
-//   payload         payload written unwrapped to the `-o` file (default: a minimal Advisory
-//                   Result, so that a test which is not about the payload still gets one the
-//                   Runner will render)
+//   payload         payload written unwrapped to the `-o` file (default: a minimal Result of
+//                   whichever Delegation Class `--output-schema` names, so that a test which is not
+//                   about the payload still gets one the Runner will render. The Verifiable default
+//                   reports the files `writeFiles` wrote and the branch it is actually on, which is
+//                   what an honest Worker does — a test about the Runner catching a dishonest one
+//                   overrides `payload` to make it lie)
 //   rawPayload      text written to the `-o` file verbatim, in place of `payload` — for the shapes
 //                   a JSON-encoded payload cannot express, such as a turn cut off mid-write
 //   writePayload    set false to exit successfully having written no payload (probe case C)
@@ -30,6 +33,8 @@
 //   refuseResume    set true to reproduce a refused `codex exec resume`: nothing on stdout at all,
 //                   the measured `thread/resume` error on stderr, exit 1. Ignored by a fresh run,
 //                   so one configuration covers both halves of the fallback
+//   sleepMs         milliseconds to wait after emitting the stream and before writing the payload —
+//                   a run long enough to be listed as running and cancelled while it is
 //   stderr          text written to stderr
 //   exitCode        process exit code (default 0)
 //
@@ -38,6 +43,7 @@
 // same record is appended to `fake-codex-invocations.jsonl`, so that a test about dedup can ask
 // how many times Codex was invoked rather than only what the last invocation looked like.
 
+import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -153,14 +159,54 @@ if (resuming && config.refuseResume === true) {
   process.exit(1);
 }
 
-const DEFAULT_PAYLOAD = {
+const refuseWrites = config.refuseWrites === true;
+const workingRoot = flags["-C"] ?? flags["--cd"] ?? process.cwd();
+
+// The files the Worker "wrote", first: the Verifiable default payload reports them, and a Worker
+// that reported files before writing them would be lying in the one direction the Runner checks for.
+const written = refuseWrites ? [] : Object.keys(config.writeFiles ?? {});
+if (!refuseWrites) {
+  for (const [relative, contents] of Object.entries(config.writeFiles ?? {})) {
+    const target = path.resolve(workingRoot, relative);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, contents);
+  }
+}
+
+const DEFAULT_ADVISORY = {
   verdict: "pass",
   summary: "ok",
   findings: [],
   next_steps: [],
 };
 
-const payload = config.payload ?? DEFAULT_PAYLOAD;
+/** The branch the working root is actually on, as a real Worker would report it. */
+function currentBranch() {
+  const run = spawnSync("git", ["-C", workingRoot, "rev-parse", "--abbrev-ref", "HEAD"], {
+    encoding: "utf8",
+  });
+  return run.status === 0 ? run.stdout.trim() : "unknown";
+}
+
+const defaultVerifiable = () => ({
+  summary: "ok",
+  branch: currentBranch(),
+  files_changed: written,
+  diff_stat: { files: written.length, insertions: written.length, deletions: 0 },
+  verification: { command: "true", exit_code: 0, passed: true },
+  caveats: [],
+  expected_failure: null,
+});
+
+// One schema per Delegation Class, so the file the Runner passed says which shape of Result it is
+// waiting for. A fake that always answered with the Advisory shape would make every Verifiable test
+// configure a payload it does not care about.
+const schemaFile = flags["--output-schema"] ?? "";
+const defaultPayload = path.basename(schemaFile) === "verifiable.json"
+  ? defaultVerifiable()
+  : DEFAULT_ADVISORY;
+
+const payload = config.payload ?? defaultPayload;
 const streamPayload = config.streamPayload ?? payload;
 // A resumed run reports the thread it was handed; a fresh one reports the thread it opened.
 const threadId = invocation.thread ?? config.threadId ?? "00000000-0000-4000-8000-000000000000";
@@ -180,15 +226,10 @@ const events = config.events ?? [
 for (const event of events) process.stdout.write(`${JSON.stringify(event)}\n`);
 if (config.streamTail) process.stdout.write(config.streamTail);
 
-const refuseWrites = config.refuseWrites === true;
-
-const workingRoot = flags["-C"] ?? flags["--cd"] ?? process.cwd();
-if (!refuseWrites) {
-  for (const [relative, contents] of Object.entries(config.writeFiles ?? {})) {
-    const target = path.resolve(workingRoot, relative);
-    mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, contents);
-  }
+// A turn that takes a while. The default SIGTERM disposition kills this outright, which is what a
+// cancelled Worker does.
+if (Number.isFinite(config.sleepMs)) {
+  await new Promise((resolve) => setTimeout(resolve, config.sleepMs));
 }
 
 const outputFile = flags["-o"] ?? flags["--output-last-message"];
