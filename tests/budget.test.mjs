@@ -179,9 +179,9 @@ describe("dedup", () => {
 
   it("never serves a Verifiable Result from cache", async (t) => {
     const fixture = await createFixtureRepo(t);
-    // The skeleton schema is what a Verifiable Delegation runs against until #9; any payload will
-    // do, because this is about what is cached rather than about what came back.
-    fixture.configureFake({ payload: { summary: "a branch somewhere" } });
+    // The fake answers the Verifiable schema it was handed. What came back does not matter here;
+    // what matters is that the second identical request runs a second Worker.
+    fixture.configureFake({});
 
     const first = await runRunner(fixture, ["delegate", "--kind", "implementation", "--prompt", "do it"]);
     assert.equal(first.code, 0, first.stderr);

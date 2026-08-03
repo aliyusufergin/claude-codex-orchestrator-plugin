@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verifiable delegation result",
+  "description": "The output schema for every Verifiable Task Kind - Implementation, Repro, Migration. Its Result is a diff in a Workspace accompanied by a mechanical pass/fail signal the Worker produced itself. The Worker runs the command and iterates against it; the Runner never re-runs it, so what is here is the whole of the evidence that the change works.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "branch",
+    "files_changed",
+    "diff_stat",
+    "verification",
+    "caveats",
+    "expected_failure"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Two or three sentences: what was asked for, what you changed to get it, and anything about the approach a reader of the diff would otherwise have to infer. Not a restatement of the file list."
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The branch the work is on, as `git rev-parse --abbrev-ref HEAD` reports it in the Workspace you were given. You did not choose it and must not change it."
+    },
+    "files_changed": {
+      "type": "array",
+      "description": "Every path you created, modified or deleted, repository-relative. An empty array says you changed nothing, which is a legitimate Result only when the request turned out to need no change - and then the summary has to say why.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "diff_stat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "insertions", "deletions"],
+      "description": "The size of the change, as `git diff --stat` counts it.",
+      "properties": {
+        "files": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many files the diff touches."
+        },
+        "insertions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lines added."
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lines removed."
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "exit_code", "passed"],
+      "description": "The Verification Signal: the command you ran to establish that the change works, and what it did. It is evidence and not authority - a passing signal never on its own licenses landing the change - so it has to name a command a reader can run again.",
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The command as you ran it, verbatim and complete, so that the reader can run the same one. Never a description of it."
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "The exit code that command last produced, reported honestly. A non-zero code with `passed` true is only correct where the Task Kind inverts the signal."
+        },
+        "passed": {
+          "type": "boolean",
+          "description": "Whether the signal is the one this task requires. For Implementation and Migration that means the command succeeded. For Repro it is inverted: the test is correct precisely when it fails, so a passing test means the test is wrong - never that the code needs changing."
+        }
+      }
+    },
+    "caveats": {
+      "type": "array",
+      "description": "What a reader has to know before landing this: what you could not verify, what you guessed at, what you left undone, and anything the Verification Signal does not cover. Empty when there is genuinely nothing - but silence here is read as a claim that the change is complete.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "expected_failure": {
+      "type": ["boolean", "null"],
+      "description": "Repro only: true when the Verification Signal is inverted, so that the command failing is the success condition. Null for every other Task Kind."
+    }
+  }
+}

@@ -260,7 +260,9 @@ describe("reasoning effort", () => {
       review: "medium",
       diagnosis: "high",
       adversarial: "high",
-      implementation: "high",
+      // Verifiable across the board (#9): the Class carries its own Verification Signal, so a
+      // Worker that reasons its way to a wrong change still fails its own tests.
+      implementation: "low",
       repro: "low",
       migration: "low",
     };

@@ -43,6 +43,10 @@ off. Apache-2.0 matches `codex-plugin-cc`, whose schemas and prompt templates ma
 **D19 — All six Task Kinds ship in the first release.** Rejected: a vertical slice, or Advisory
 first. Accepted cost — six prompt templates written before real usage informs them.
 
+*Four of the six exist as of #9*: Review, Diagnosis, Adversarial and Implementation. Repro and
+Migration have a Delegation Class, a schema and a sandbox mode already; what they still need is a
+prompt template and a Forwarder each.
+
 ---
 
 ## Taxonomy
@@ -61,8 +65,16 @@ is never passed — published model names are inconsistent across sources and ch
 Codex's own precedence, so "overridable by the user's `config.toml`" can only mean the Runner does
 not pass the flag at all when their config sets the key — it scans `$CODEX_HOME/config.toml` and
 `<cwd>/.codex/config.toml` for a top-level `model_reasoning_effort` and defers to either. And D16
-names five Task Kinds: Implementation sits at `high`, alongside the other kinds asked for judgement
-rather than mechanism, until #9 calibrates it.
+names five Task Kinds.
+
+*Implementation settled on #9, at `low`.* It sat at `high` in the meantime, on the reasoning that it
+is asked for judgement rather than mechanism. What decides it is the **Delegation Class** rather than
+the Task Kind: an Advisory Result is judgement and nothing checks it, so thought is what is being
+bought, while a Verifiable Result carries its own **Verification Signal** — a Worker that reasons its
+way to a wrong change still fails its own tests, and the iterations it then spends buy more than the
+reasoning would have. Effort now splits along the Class boundary: Advisory `medium`/`high`,
+Verifiable `low` throughout. Still provisional in O3's sense, and the Ledger's durations are what
+settle it against real runs.
 
 **D20 — Two output schemas, one per Delegation Class.**
 
@@ -73,6 +85,20 @@ rather than mechanism, until #9 calibrates it.
 *Verifiable*: `summary`, `branch`, `files_changed[]`, `diff_stat`, `verification`
 (`command`, `exit_code`, `passed`), `caveats[]`. Task Kind differences ride as optional fields —
 `expected_failure` for **Repro**.
+
+*Verifiable implemented on #9* (`schemas/verifiable.json`). `diff_stat` is an object —
+`files`, `insertions`, `deletions` — rather than the string `git diff --stat` prints, because the
+Ledger records diff sizes for O3's calibration and a sentence would have to be parsed back. Like
+Advisory's nullable-but-required fields, `expected_failure` is required and nullable: a Worker
+cannot omit it, and every Kind but **Repro** nulls it. The Runner re-checks the payload on the way
+back, and splits what it finds by what it costs, exactly as Advisory does — but with one check
+Advisory has no equivalent of. A missing **Verification Signal** is fatal, because the Class *is*
+the signal; and so is a Worker reporting files its **Workspace** does not hold, which is probe case
+C in its most expensive form. Everything else — a claimed file the Workspace has no change to, a
+changed file the Worker did not report, a branch it names wrongly, a malformed `diff_stat` — is
+reported on stderr and rendered anyway. What the rendering lists as changed is the Runner's own
+measurement of the Workspace, never the Worker's claim: that is the half of a Verifiable Result
+that cannot be fabricated.
 
 *Advisory implemented on #5* (`schemas/advisory.json`). Vocabularies the decision left open:
 `verdict` is `pass` / `concerns` / `blocking`, `severity` is `critical` / `high` / `medium` / `low`,
@@ -130,6 +156,16 @@ for running Codex at all: serving a cached Result needs no Worker, and neither d
 returning to the flow. Verifiable runs for minutes and its result is a branch, so it runs in the
 background and reports on completion.
 
+*Implemented on #9.* The non-blocking is the **Forwarder**'s, not the Runner's: the Runner runs to
+completion in one process, and the Forwarder starts it as a background Bash call so the harness's
+own completion notification is what carries the Result back. Nothing is forked and no job daemon
+exists — a second process supervising the first would be state to reconcile, and the harness already
+has the thing that reports on a finished command. What the Runner does add is an announcement: the
+Delegation's id, its Workspace and its branch go to stdout the moment they exist, before the minutes
+of work, so that the run is addressable while it happens. `/delegate:status` lists it from a live
+record on disk, `/delegate:cancel <id>` signals the Runner that record names, and `/delegate:result
+<id>` retrieves the whole Result afterwards if the notification never arrives.
+
 **D11 — Advisory Delegations resume; Verifiable are single-shot.** Advisory persists `thread_id`
 and follow-ups continue the thread via `codex exec resume`, so dialogue with a reviewer is cheap.
 Verifiable always starts clean and may pass `--ephemeral`. If a resume attempt fails, the Runner
@@ -179,6 +215,35 @@ uncommitted changes plus untracked, non-ignored files. The Worker sees what the 
 against them, and reports command, exit code and verdict. The Runner does not re-run them. For
 **Repro** the semantics invert: the test is correct when it *fails*, so a passing test means the
 test is wrong and must be fixed — never the code.
+
+**D4, D5 and D6 implemented on #9**, with four details the decisions did not settle.
+
+*First, the seed is a commit.* D5 says the Workspace is seeded from the working tree; it does not say
+whether that arrives as uncommitted state or as a commit. It arrives as a commit on the Workspace's
+own branch, whose parent is the session's `HEAD` — so the branch *point* is still `HEAD` as D4
+requires, and the Worker's own change is readable as a diff against one named commit. Left
+uncommitted, the Worker's diff and the user's unfinished work would arrive as one indistinguishable
+pile, for the Worker, for the reconciliation, and for the Landing that comes later. The seed commit
+is attributed to `delegate`, not to the user, and skips hooks and signing: it is bookkeeping, not
+authorship, and the hooks in the shared `.git` would otherwise run against a commit nobody made.
+
+*Second, the seeding is read-only on the user's side.* `git diff --binary HEAD` piped into
+`git apply` in the Workspace carries staged and unstaged changes, deletions and mode changes;
+`git ls-files --others --exclude-standard` carries the untracked, non-ignored files, copied with
+their executable bit. Nothing writes to the user's index, working tree or object database, and the
+test that matters asserts the working tree is byte-identical across a run in which the Worker wrote
+files.
+
+*Third, the Runner measures the Workspace itself.* D6 says the Runner does not re-run the Worker's
+command, and it does not — but it does look at what the Workspace holds, `git diff --name-only`
+against the seed commit plus the untracked files. That is not verification; it is the reconciliation
+of #6 applied to a Class whose Result is a diff. A Worker reporting files that are not there fails
+the Delegation.
+
+*Fourth, an empty Workspace is swept and a written-in one is not.* D22 leaves unlanded work alone
+because it is the user's. A Workspace a failed run wrote nothing into is not that — it is a worktree
+and a branch the plugin left behind — so it is removed with its branch, and the distinction is
+measured rather than assumed.
 
 **D22 — A Delegation outlives its session.** `SessionEnd` collects only Workspaces that are
 finished-and-Landed or untouched. A running Worker is left alone: its Budget is already spent, and
@@ -243,6 +308,10 @@ the same window.
 | `/delegate:quota` | Budget state; raise the ceiling |
 | `/delegate:clean` | Collect unlanded Workspaces and branches |
 
+Shipped so far: `/delegate:result` and `/delegate:quota` (#5, #7), `/delegate:status` and
+`/delegate:cancel` (#9). All four are `disable-model-invocation` — they are the user's commands, and
+the Orchestrator reaches a Delegation through a Forwarder or not at all.
+
 ---
 
 ## Corrections from the consistency audit
@@ -306,7 +375,10 @@ tree as it then is. It reuses this helper rather than writing a second one.
 Two further narrowings, both deliberate. Only **Advisory** Results are cached: a Verifiable Result
 names a branch in a **Workspace**, and D22 sweeps Workspaces, so serving one a second time would
 point the Orchestrator at work that may already have been Landed or collected — worse than spending
-the Delegation. #9 decides what dedup means once a Workspace exists. And the cache hit announces
+the Delegation. *Settled on #9: dedup for Verifiable means running it again.* The lookup is now
+skipped outright rather than left to miss, because a Workspace that has since been Landed, swept, or
+gone **Stale** under a working tree that moved on is worse than the Delegation it would have saved,
+and the Budget is what bounds a caller who asks twice. And the cache hit announces
 itself on **stdout**, not stderr: a Forwarder returns stdout verbatim and reads stderr only when the
 Runner exits non-zero, so the notice that a Result is *n* minutes old would otherwise reach nobody
 at all — which, given the uncommitted-work caveat above, is the disclosure that matters most.
@@ -330,8 +402,15 @@ allowances, `~/.codex` and `/tmp`, which fail at different layers and must be re
 helper, which mounts over paths inside it. A worktree under `/tmp` was shadowed by those mounts
 during the probe: the Worker wrote its file, truthfully reported success, and the file was gone
 afterwards. The payload directory the Runner hands Codex moved from `tmpdir()` to `$CODEX_HOME` on
-#4, which lands C5's preferred path; the Workspace itself is still #9's to place. *(Raised on #9
-and #4.)*
+#4, which lands C5's preferred path. *(Raised on #9 and #4.)*
+
+*Settled on #9 for the Workspace itself.* Workspaces live under the state directory, and the rule is
+checked rather than assumed: `/tmp` and `$TMPDIR` are treated as one set of roots nothing may live
+under, symlinks resolved, and a state directory that falls inside one sends Workspaces to
+`$CODEX_HOME/delegate/workspaces` with the relocation stated on stderr. If even that is inside one,
+the Delegation is refused — there is nowhere left where a Worker's writes are safe, and running
+anyway is the one outcome with no visible failure. `$DELEGATE_TMP_DIR` replaces the whole set rather
+than joining it, because the fixtures a test owns are themselves under the machine's `/tmp`.
 
 **C7 — Which tool-router errors fail a Delegation is decided by the Delegation Class.** #6's
 criterion is blunt: any tool-router error fails the run, whatever the exit code. Measured against
@@ -411,8 +490,9 @@ directory, the environment winning:
 
 Every one of them is a placeholder. The window is the shape the Worker's provider enforces rather
 than a measurement of it; the ceiling is a guess at how many Delegations fit in one; the TTL is set
-by how long a working tree stays recognisable, not by data; the threshold has no consumer yet —
-Landing is #10's. `/delegate:quota` prints all four with where each came from and says they are
+by how long a working tree stays recognisable, not by data. The threshold gained its first consumer
+on #9: a Verifiable rendering whose `diff_stat` exceeds it says so, and says the decision to Land is
+the user's — the Landing itself is still #10's. `/delegate:quota` prints all four with where each came from and says they are
 provisional, and the Ledger records what closing this needs: Delegation counts per window,
 durations, and diff sizes.
 

@@ -98,7 +98,11 @@ the build or test suite rather than by reading the diff.
 **Workspace**:
 The throwaway git worktree a Verifiable Delegation runs in, branched from the Orchestrator's
 current `HEAD` and seeded with the working tree — uncommitted changes and untracked,
-non-ignored files included. The user's own working tree is never written to by a Worker.
+non-ignored files included. That seed is its own commit on the Workspace's branch, so the Worker's
+change is readable as a diff against one named point. It lives outside `/tmp` and anything else
+Codex's sandbox may be handed as writable, because a worktree there is mounted over and the
+Worker's writes vanish while every layer reports success. The user's own working tree is never
+written to by a Worker.
 _Avoid_: worktree, sandbox, scratch dir
 
 **Thread**:
