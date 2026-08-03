@@ -439,7 +439,7 @@ function watchRun() {
     if (!failures.includes(failure)) failures.push(failure);
   };
 
-  function readEvent(line) {
+  function readEvent(line, { final = false } = {}) {
     if (line.trim() === "") return;
 
     let event;
@@ -448,6 +448,13 @@ function watchRun() {
     } catch {
       // A line that is not JSON is not evidence of anything. `--json` is documented as JSONL, and
       // a build that prints one banner on stdout must not turn every run into a failure.
+      //
+      // The last line is different when it was going to be a record: the stream stopped mid-write,
+      // so whatever it was about to say is lost — and a run whose stream was cut off while exiting
+      // cleanly is exactly the shape this reconciliation exists to distrust.
+      if (final && line.trimStart().startsWith("{")) {
+        note(`the event stream ended mid-record: ${oneLine(line)}`);
+      }
       return;
     }
     if (event === null || typeof event !== "object") return;
@@ -513,7 +520,7 @@ function watchRun() {
      * process ended, in the caller's words.
      */
     failure(outcome) {
-      readEvent(stdoutRest);
+      readEvent(stdoutRest, { final: true });
       readDiagnostic(stderrRest);
       stdoutRest = "";
       stderrRest = "";
@@ -721,10 +728,16 @@ function location(finding) {
  * instead of arriving as the Runner's own text.
  */
 function quoted(text) {
-  return text
-    .split("\n")
-    .map((line) => (line.trim() === "" ? ">" : `> ${line}`))
-    .join("\n");
+  return (
+    text
+      // A bare `\r` is a line ending to a Markdown renderer and not to `split("\n")`, so a Worker
+      // that puts one in its prose gets the text after it rendered outside the quote. Every line
+      // ending is normalised first, and the quote holds whatever the Worker wrote.
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .map((line) => (line.trim() === "" ? ">" : `> ${line}`))
+      .join("\n")
+  );
 }
 
 /**
