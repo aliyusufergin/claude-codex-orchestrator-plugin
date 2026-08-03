@@ -8,10 +8,11 @@
 //   2  the invocation was wrong
 //
 // The Workspace lands on top of this in later work. The Worker process contract — sandbox-mode
-// selection (ADR-0004) and the environment allowlist — is here, as is the Advisory path end to end:
-// prompt template, output schema, reasoning effort, persistence, event-stream reconciliation, and
-// the compact rendering the Orchestrator gets. So is the bound of ADR-0002: the Delegation Budget
-// and the dedup cache, enforced here rather than in any agent or command prompt.
+// selection (ADR-0004) and the environment allowlist — is here, as is the Advisory path end to end
+// for all three of its Task Kinds: prompt template, output schema, reasoning effort, persistence,
+// event-stream reconciliation, thread resume with its visible fallback (D11), and the compact
+// rendering the Orchestrator gets. So is the bound of ADR-0002: the Delegation Budget and the dedup
+// cache, enforced here rather than in any agent or command prompt.
 //
 // Environment variables the Runner reads for itself. None reaches the Worker unless the user
 // puts it on the allowlist by name. The four numbers the plugin enforces have their own
@@ -46,6 +47,7 @@ import {
   dedupKey,
   record,
   repoIdentity,
+  uncommittedDigest,
 } from "./budget.mjs";
 import { SETTINGS, readSettings, writeSetting } from "./config.mjs";
 
@@ -124,6 +126,17 @@ const CLAIM_MAX_CHARS = 240;
  * every run — so this is matched by name, and nothing else on stderr is read as failure.
  */
 const TOOL_ROUTER_ERROR = /codex_core::tools::router/;
+
+/**
+ * Codex refusing to resume a thread. Measured on 0.146.0 against an id with no rollout behind it:
+ * `Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)`,
+ * on stderr, exit `1`, and not one byte on stdout — no `thread.started`, no events at all.
+ *
+ * Matched to name the cause in the degradation notice, never to decide it. What decides is the
+ * absence of a thread: a resume that opened one and then failed is a failed Delegation like any
+ * other, and re-running it fresh would spend a second Delegation on the same failure.
+ */
+const RESUME_REFUSED = /thread\/resume/i;
 
 /**
  * The tool-router errors that are Codex's own sandbox refusing a write rather than a tool call
@@ -375,10 +388,10 @@ function reasoningEffort(kind, cwd) {
   };
 }
 
-function spawnCodex(args, watcher) {
+function spawnCodex(args, watcher, { cwd }) {
   return new Promise((resolve) => {
     const child = spawn(codexBinary(), args, {
-      cwd: process.cwd(),
+      cwd,
       env: workerEnv(),
       // stdin is /dev/null: `codex exec` reads it to EOF before starting the turn, so an
       // inherited open stdin hangs it forever. stdout carries the JSONL event stream, which the
@@ -461,6 +474,8 @@ function workerClaim(text) {
 function watchRun({ delegationClass }) {
   const failures = [];
   let claim = null;
+  let threadId = null;
+  let resumeRefusal = null;
   let deniedWrite = false;
   let stdoutRest = "";
   let stderrRest = "";
@@ -489,6 +504,14 @@ function watchRun({ delegationClass }) {
     }
     if (event === null || typeof event !== "object") return;
 
+    // The id an Advisory follow-up resumes (D11). It arrives on the first event of every run,
+    // fresh or resumed, and it is the whole of what makes a Result continuable.
+    if (event.type === "thread.started") {
+      if (typeof event.thread_id === "string" && event.thread_id.trim() !== "") {
+        threadId = event.thread_id.trim();
+      }
+      return;
+    }
     if (event.type === "error") {
       note(`the run reported an error: ${messageOf(event)}`);
       return;
@@ -524,6 +547,7 @@ function watchRun({ delegationClass }) {
   }
 
   function readDiagnostic(line) {
+    if (resumeRefusal === null && RESUME_REFUSED.test(line)) resumeRefusal = oneLine(line);
     if (!TOOL_ROUTER_ERROR.test(line)) return;
 
     if (delegationClass === "advisory" && WRITE_DENIED_BY_POLICY.test(line)) {
@@ -556,6 +580,14 @@ function watchRun({ delegationClass }) {
     },
     stderr(chunk) {
       stderrRest = feed(stderrRest, chunk, readDiagnostic);
+    },
+    /** The thread this run happened in, or `null` if one never opened. */
+    thread() {
+      return threadId;
+    },
+    /** Codex's own words for refusing to resume, if it said any. Diagnostic, never the decision. */
+    resumeRefusal() {
+      return resumeRefusal;
     },
     /**
      * What this run showed to have failed, or `null` if nothing in it says anything did. Kept as
@@ -594,45 +626,65 @@ function renderFailure({ codex, failures, claim }) {
 }
 
 /**
- * Run one `codex exec` and return `{ payload, failure }`: the payload it wrote, and the reason the
- * run is a failed Delegation despite having produced one. A run that failed without writing
- * anything at all throws instead — there is nothing to persist and nothing to reconcile.
+ * The argv for one run, fresh or resumed, and the directory the process runs in.
+ *
+ * `codex exec resume` is not `codex exec` with an id on the end. Measured on 0.146.0: it takes
+ * `--json`, `-c`, `--output-schema` and `-o` like its parent, and it takes **neither `-s` nor
+ * `-C`**. So the two things the Runner is not willing to leave to Codex's own defaults have to
+ * travel another way:
+ *
+ *   - the sandbox mode as `-c sandbox_mode=<mode>`, which takes the same three values `-s` does and
+ *     is rejected by name if it does not (`unknown variant ... expected one of read-only,
+ *     workspace-write, danger-full-access`), so a typo here is a failed run rather than a Worker
+ *     with more authority than its Delegation Class allows;
+ *   - the working directory as the child process's own, because there is no flag for it. That is
+ *     still not the Runner cd'ing — its own working directory is untouched, and `-C` is used
+ *     wherever it exists.
+ *
+ * Everything after `--` is a positional, so a prompt that opens with a dash is a prompt and not a
+ * flag. On the resume form the two positionals are the thread and then the prompt, in that order.
+ */
+function codexArgs({ prompt, cwd, sandbox, schema, outputFile, extraArgs, thread }) {
+  // The reasoning effort rides in `extraArgs`, and nothing else the caller wants to configure —
+  // a model name never travels on either form.
+  const common = ["--json", ...extraArgs, "--output-schema", schema, "-o", outputFile];
+
+  if (thread === null) {
+    return {
+      args: ["exec", ...common, "-s", sandbox, "-C", cwd, "--", prompt],
+      // The Runner never cd's: a subagent's working directory is not the Runner's to move, and
+      // `-C` carries it instead.
+      spawnCwd: process.cwd(),
+    };
+  }
+  return {
+    args: ["exec", "resume", ...common, "-c", `sandbox_mode=${sandbox}`, "--", thread, prompt],
+    spawnCwd: cwd,
+  };
+}
+
+/**
+ * Run one `codex exec`, fresh or resumed, and return `{ payload, failure, thread, resumeUnavailable }`:
+ * the payload it wrote, the reason the run is a failed Delegation despite having produced one, the
+ * thread it happened in, and — for a resume only — the reason there was no thread to resume. A run
+ * that failed without writing anything at all throws instead; there is nothing to persist and
+ * nothing to reconcile.
  *
  * `--output-schema` plus `-o <file>` writes the payload already unwrapped, while the copy in the
  * event stream's `agent_message.text` is double-encoded — so the file is the source.
  */
-async function runCodex({ prompt, cwd, sandbox, schema, delegationClass, extraArgs = [] }) {
+async function runCodex({ prompt, cwd, sandbox, schema, delegationClass, extraArgs = [], thread = null }) {
   // The payload directory is not under `/tmp`: Codex's sandbox helper mounts over paths there,
   // and a file it shadows is written, reported as written, and absent afterwards (ADR-0004).
   // `$CODEX_HOME` is the one directory the Runner has already established is writable.
   const payloadDir = mkdtempSync(path.join(codexHome(), "delegate-"));
   const outputFile = path.join(payloadDir, "payload.json");
 
-  const args = [
-    "exec",
-    "--json",
-    "-s",
-    sandbox,
-    // The reasoning effort, and nothing else the caller wants to configure — a model name never
-    // travels here.
-    ...extraArgs,
-    "--output-schema",
-    schema,
-    "-o",
-    outputFile,
-    // The working directory travels as a flag. The Runner never cd's: a subagent's cwd is not
-    // the Runner's to move.
-    "-C",
-    cwd,
-    // Everything after `--` is the prompt, so a prompt that opens with a dash is a prompt and
-    // not a flag.
-    "--",
-    prompt,
-  ];
+  const { args, spawnCwd } = codexArgs({ prompt, cwd, sandbox, schema, outputFile, extraArgs, thread });
 
   try {
     const watcher = watchRun({ delegationClass });
-    const { code, signal, spawnError } = await spawnCodex(args, watcher);
+    const { code, signal, spawnError } = await spawnCodex(args, watcher, { cwd: spawnCwd });
 
     // A spawn failure is not a run: there is no stream, no claim and nothing to reconcile.
     if (spawnError) throw failed(`could not run ${codexBinary()}: ${spawnError.message}`);
@@ -640,18 +692,42 @@ async function runCodex({ prompt, cwd, sandbox, schema, delegationClass, extraAr
     // The reconciliation is read before the exit code and before the signal, because how the
     // process ended is the weaker evidence of the two: a run that failed and exited `0` is the case
     // this exists for, and a run that died is better described by what it showed than by the number
-    // or the signal that ended it.
+    // or the signal that ended it. It also flushes both streams, so what the watcher saw is
+    // complete from here on.
     const failure = watcher.failure(signal ? `was killed by ${signal}` : `exited ${code}`);
+    const payload = existsSync(outputFile) ? readFileSync(outputFile, "utf8") : null;
+
+    // A resume that never opened a thread did not run: Codex refused before the turn began, so
+    // there is nothing to fail and nothing to reconcile, and the caller can still have its answer
+    // from a fresh Delegation. Decided by the absence of a thread rather than by the message on
+    // stderr — a resume that opened one and then failed is a failed Delegation like any other, and
+    // re-running that fresh would spend a second Delegation on the same failure.
+    //
+    // This is deliberately wider than the one measured refusal. Anything that stops `codex exec
+    // resume` before its first event lands here — a missing rollout, a directory it will not trust,
+    // a config it will not load — and every one of them is a case where a fresh Delegation can
+    // still produce the answer. What is reported is what was observed, never a guess at which of
+    // them it was: the notice quotes Codex's own line when there is one and says only that the
+    // thread did not open when there is not.
+    if (thread !== null && watcher.thread() === null && payload === null && !signal && code !== 0) {
+      return {
+        payload: null,
+        failure: null,
+        thread: null,
+        resumeUnavailable: watcher.resumeRefusal() ?? `codex exec resume exited ${code} without opening a thread`,
+      };
+    }
+
     if (signal) throw failed(failure ? renderFailure(failure) : `codex exec was killed by ${signal}`);
 
-    const payload = existsSync(outputFile) ? readFileSync(outputFile, "utf8") : null;
-    if (failure) return { payload, failure };
+    const ranIn = watcher.thread();
+    if (failure) return { payload, failure, thread: ranIn, resumeUnavailable: null };
 
     if (code !== 0) throw failed(`codex exec exited ${code}`);
     if (payload === null) throw failed("codex exec wrote no payload");
     if (payload.trim() === "") throw failed("codex exec wrote an empty payload");
 
-    return { payload, failure: null };
+    return { payload, failure: null, thread: ranIn, resumeUnavailable: null };
   } finally {
     rmSync(payloadDir, { recursive: true, force: true });
   }
@@ -862,13 +938,25 @@ function quoted(text) {
  * `evidence` is carried in full up to a generous cap rather than summarised, because it is the one
  * field the Orchestrator has to compare against the file byte for byte.
  */
-function renderAdvisory({ id, kind, payload, persisted }) {
+function renderAdvisory({ id, kind, payload, persisted, thread, thread_id: threadId, resume_unavailable: resumeUnavailable }) {
   // Every field but `evidence` is rendered defensively: a Result reaches here having been reported
   // as imperfect rather than refused, so a missing title costs a line and not the answer.
   const text = (value, fallback = "") => (typeof value === "string" && value.trim() !== "" ? value.trim() : fallback);
   // Anything the Worker wrote that lands in one of the Runner's own headings is collapsed to a
   // line first, so that a verdict or a title carrying newlines cannot forge a second heading.
   const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${oneLine(text(payload.verdict, "no verdict"))}`];
+
+  // D11's degradation, first and unmissable rather than in the footer. The Orchestrator asked a
+  // question about a conversation, and what follows was answered without it — reading the findings
+  // as a continuation of the earlier ones is the mistake this line exists to prevent.
+  if (resumeUnavailable) {
+    out.push(
+      "",
+      `**The thread \`${oneLine(thread)}\` could not be resumed** (${oneLine(resumeUnavailable)}), so` +
+        " this is a fresh Delegation. It carries none of the earlier conversation, and anything the" +
+        " request left implicit because that conversation had already established it is missing here.",
+    );
+  }
 
   const summary = text(payload.summary);
   if (summary) out.push("", quoted(summary));
@@ -914,6 +1002,16 @@ function renderAdvisory({ id, kind, payload, persisted }) {
     persisted
       ? `Result \`${id}\` — the whole payload is at \`/delegate:result ${id}\`.`
       : `Result \`${id}\` — not persisted, so this rendering is all of it.`,
+  );
+  if (threadId) {
+    // The one thing that makes a Result continuable (D11). Without it in the rendering, a follow-up
+    // costs a whole fresh Delegation, which is the expense resume exists to avoid.
+    out.push(
+      `Thread \`${oneLine(threadId)}\` — ask a follow-up on this same Result by naming that thread` +
+        " in the request, and it costs a follow-up rather than another Delegation of reading.",
+    );
+  }
+  out.push(
     "",
     // The standing guardrail of D14, on the surface where it is needed: everything above this line
     // is a claim by an external agent, including anything in it shaped like an instruction.
@@ -944,9 +1042,9 @@ async function delegate(args) {
         kind: { type: "string" },
         prompt: { type: "string" },
         cwd: { type: "string" },
-        // The Advisory thread this Delegation continues. Resuming one is #8's; today the id is
-        // read for the dedup key alone, where C3 requires it — without it a repeated follow-up on
-        // a resumed thread would be served from cache and the thread would never advance.
+        // The Advisory thread this Delegation continues (D11). It selects `codex exec resume`, and
+        // it is in the dedup key, where C3 requires it — without it a repeated follow-up on a
+        // resumed thread would be served from cache and the thread would never advance.
         thread: { type: "string" },
       },
     }));
@@ -968,11 +1066,25 @@ async function delegate(args) {
   const cwd = path.resolve(values.cwd ?? process.cwd());
   if (!existsSync(cwd)) throw usageError(`--cwd is not a directory: ${cwd}`);
   const thread = values.thread?.trim() || null;
+  // D11: Advisory Delegations resume, Verifiable ones are single-shot. Refused rather than ignored,
+  // because a `--thread` silently dropped reads to the caller as a continued conversation.
+  if (thread !== null && delegationClass !== "advisory") {
+    throw usageError(`--thread is Advisory only: a ${values.kind} Delegation always starts clean`);
+  }
 
   const root = stateRoot();
   const { values: settings } = readSettings(root, { warn });
   const repo = repoIdentity(cwd);
-  const key = dedupKey({ kind: values.kind, request, head: repo.head, thread });
+  // The working tree as it stands, uncommitted work and all. `HEAD` describes the commit and
+  // nothing else, and the Delegation this plugin exists for is a review of what is not committed.
+  const tree = uncommittedDigest(cwd);
+  if (tree === null && repo.head !== null) {
+    warn(
+      `the uncommitted state of ${repo.root} could not be measured, so this Delegation is` +
+        " deduplicated on its commit alone and the dedup TTL is the only thing that expires it",
+    );
+  }
+  const key = dedupKey({ kind: values.kind, request, head: repo.head, thread, tree });
 
   // The dedup cache is consulted before anything that costs, and before the checks that decide
   // whether Codex could even run: serving a Result the Runner already has needs no Worker.
@@ -983,9 +1095,10 @@ async function delegate(args) {
     // is the one thing about a cached Result the Orchestrator has to know before acting on it.
     process.stdout.write(
       `${cached.stdout}\n_Served from the dedup cache: an identical Delegation — same Task Kind,` +
-        ` prompt, HEAD and thread — returned this Result ${cached.age_minutes.toFixed(1)} minutes` +
-        " ago, so no Delegation was spent. `HEAD` is the only thing about the tree in the key, so" +
-        " if the working tree has changed since, this Result is that much out of date._\n",
+        " prompt, thread, commit and uncommitted working tree — returned this Result" +
+        ` ${cached.age_minutes.toFixed(1)} minutes ago, so no Delegation was spent. The key covers` +
+        " every tracked and untracked, non-ignored file; an ignored file, or anything outside the" +
+        " repository, may still have moved under it._\n",
     );
     // Best-effort: a cache hit is calibration data, not a bound, and losing the note costs nothing.
     try {
@@ -1062,6 +1175,11 @@ async function delegate(args) {
         // Advisory produces no diff. Present and null rather than absent, so that calibration can
         // tell "no diff" from "not recorded" once #9 lands the Verifiable path.
         diff_lines: null,
+        // Whether this Delegation continued a thread, and whether it tried to and could not. How
+        // often a persisted thread is still resumable is what says whether Advisory dialogue is
+        // cheaper in practice than D11 assumes it is.
+        resumed: thread !== null && resumeUnavailable === null,
+        resume_unavailable: resumeUnavailable !== null,
         ...extra,
       });
     } catch {
@@ -1070,15 +1188,36 @@ async function delegate(args) {
   };
 
   let rendered;
+  // Set when a resume was attempted and refused. Declared here because it outlives the run: it goes
+  // into the Result, into the rendering, and into the Ledger.
+  let resumeUnavailable = null;
   try {
-    const { payload: raw, failure } = await runCodex({
+    const run = {
       prompt: composePrompt(values.kind, request),
       cwd,
       sandbox: mode,
       schema: SCHEMA_BY_CLASS[delegationClass],
       delegationClass,
       extraArgs: effortArgs,
-    });
+    };
+
+    let attempt = await runCodex({ ...run, thread });
+    // D11: a resume that Codex refused falls back to a fresh Delegation, and the degradation is
+    // carried into the Result rather than swallowed. The follow-up the caller asked for is a
+    // question about a conversation the Worker no longer has, so an answer that does not say so
+    // reads as continuous when it is not.
+    //
+    // The Budget is not counted a second time. Codex refused the id before the turn began, so the
+    // provider was never asked — and the Budget counts what was asked of it.
+    if (attempt.resumeUnavailable) {
+      resumeUnavailable = attempt.resumeUnavailable;
+      warn(
+        `the Advisory thread ${thread} could not be resumed (${resumeUnavailable}) —` +
+          " delegating fresh instead, and this Result carries none of that conversation",
+      );
+      attempt = await runCodex({ ...run, thread: null });
+    }
+    const { payload: raw, failure, thread: ranIn } = attempt;
 
     // What came back is persisted before it is parsed, checked or rendered: the Budget for it is
     // already spent, and the Result the Runner will not render is exactly the one worth being able
@@ -1091,10 +1230,16 @@ async function delegate(args) {
       cwd,
       sandbox: mode,
       reasoning_effort: level ?? null,
+      // What was asked for, and what was actually run in. They differ exactly when a resume was
+      // refused, which is the case `resume_unavailable` names.
       thread,
+      thread_id: ranIn,
       request,
       payload: null,
     };
+    // D11's visible degradation: a resume that was refused is part of the Result, because a
+    // follow-up answered without the conversation behind it is not the answer that was asked for.
+    if (resumeUnavailable) resultRecord.resume_unavailable = resumeUnavailable;
     // A reconciliation failure is part of the Result, not a footnote to it: the payload below is
     // the Result the Worker claimed, and this is the reason it is not one.
     if (failure) resultRecord.failure = failure;

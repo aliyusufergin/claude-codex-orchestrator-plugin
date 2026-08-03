@@ -4,7 +4,7 @@
 // directory, and what it said when it refused.
 
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { advisoryPayload, createFixtureRepo, git, runRunner } from "./helpers/harness.mjs";
@@ -33,7 +33,9 @@ describe("dedup", () => {
     // is reported on stdout, because a Forwarder returns stdout verbatim and reads stderr only
     // when the Runner exits non-zero. On stderr this would reach nobody.
     assert.match(second.stdout, /dedup cache/i);
-    assert.match(second.stdout, /out of date/i);
+    // What the key covers, stated on the surface the Orchestrator reads. Since #8 that includes the
+    // uncommitted working tree, so the notice no longer has to warn that the tree may have moved.
+    assert.match(second.stdout, /uncommitted working tree/i);
   });
 
   it("invokes Codex again when only the thread differs", async (t) => {
@@ -66,6 +68,86 @@ describe("dedup", () => {
 
     assert.equal(second.code, 0, second.stderr);
     assert.equal(fixture.invocations().length, 2, "the same prompt at a new HEAD was served from cache");
+  });
+
+  it("invokes Codex again when an uncommitted file has changed under the same HEAD", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({ payload: advisoryPayload() });
+
+    writeFileSync(path.join(fixture.repo, "README.md"), "# fixture\nfirst draft\n");
+    await runRunner(fixture, REVIEW);
+    assert.equal(fixture.invocations().length, 1);
+
+    // Same Task Kind, same prompt, same thread, same commit — and a different tree. Reviewing an
+    // uncommitted diff is the plugin's first use, so before #8 this was the case where the cache
+    // handed back an answer about code that no longer existed.
+    writeFileSync(path.join(fixture.repo, "README.md"), "# fixture\nsecond draft\n");
+    const second = await runRunner(fixture, REVIEW);
+
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(fixture.invocations().length, 2, "an edited working tree was served from cache");
+  });
+
+  it("invokes Codex again when an untracked file has appeared", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({ payload: advisoryPayload() });
+
+    await runRunner(fixture, REVIEW);
+    assert.equal(fixture.invocations().length, 1);
+
+    // A Workspace is seeded from untracked, non-ignored files too (D5), so the tree the Worker
+    // would see is not the same tree.
+    writeFileSync(path.join(fixture.repo, "scratch.txt"), "not committed anywhere\n");
+    const second = await runRunner(fixture, REVIEW);
+
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(fixture.invocations().length, 2, "a new untracked file was served from cache");
+  });
+
+  it("still serves from cache when nothing about the tree has moved", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({ payload: advisoryPayload() });
+
+    writeFileSync(path.join(fixture.repo, "README.md"), "# fixture\nmid-change\n");
+    await runRunner(fixture, REVIEW);
+
+    // The measurement has to be stable across two runs over an unchanged tree, or the cache never
+    // hits at all and the widened key has quietly disabled the guard it was widening.
+    const second = await runRunner(fixture, REVIEW);
+
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(fixture.invocations().length, 1, "an unchanged tree hashed differently twice");
+    assert.match(second.stdout, /dedup cache/i);
+  });
+
+  it("says so when a repository's tree cannot be measured, rather than deduplicating on the commit alone", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({ payload: advisoryPayload() });
+
+    // A repository whose index `git status` will not read: `HEAD` still resolves, so there is a
+    // commit in the key and no tree beside it. That is the pre-#8 behaviour, with the TTL as the
+    // only guard — stated rather than left to be inferred.
+    writeFileSync(path.join(fixture.repo, ".git", "index"), "not an index");
+
+    const run = await runRunner(fixture, REVIEW);
+
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stderr, /could not be measured/);
+    assert.match(run.stderr, /dedup TTL/);
+  });
+
+  it("does not warn about a tree a non-repository was never going to have", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({ payload: advisoryPayload() });
+
+    // No commit either, so nothing about this Delegation got narrower than it already was.
+    const outside = path.join(fixture.root, "not-a-repo");
+    mkdirSync(outside, { recursive: true });
+
+    const run = await runRunner(fixture, REVIEW, { cwd: outside });
+
+    assert.equal(run.code, 0, run.stderr);
+    assert.doesNotMatch(run.stderr, /could not be measured/);
   });
 
   it("stops serving from cache once the dedup TTL has passed", async (t) => {

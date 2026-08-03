@@ -18,6 +18,8 @@ would live only in a conversation transcript.
 | [`docs/adr/0004`](../adr/0004-disable-codex-sandbox-under-outer-sandbox.md) | Preferring Codex's own sandbox under an outer one, `danger-full-access` as fallback |
 | [`docs/research/claude-code-orchestrating-codex.md`](../research/claude-code-orchestrating-codex.md) | Both products' extension surfaces, cited |
 | [`docs/research/sandbox-nesting-probe.md`](../research/sandbox-nesting-probe.md) | Measured sandbox behaviour |
+| [`docs/research/exec-event-stream-shape.md`](../research/exec-event-stream-shape.md) | The `--json` event stream as it actually arrives |
+| [`docs/research/exec-resume-surface.md`](../research/exec-resume-surface.md) | `codex exec resume`'s flags, and what a refusal looks like |
 
 ---
 
@@ -74,7 +76,12 @@ rather than mechanism, until #9 calibrates it.
 
 *Advisory implemented on #5* (`schemas/advisory.json`). Vocabularies the decision left open:
 `verdict` is `pass` / `concerns` / `blocking`, `severity` is `critical` / `high` / `medium` / `low`,
-`confidence` is a number from 0 to 1. `file`, `line_start` and `line_end` are required but nullable,
+`confidence` is a number from 0 to 1. *(Widened on #8: `verdict`'s three words were defined for
+Review alone, and Diagnosis and Adversarial now share the schema. The vocabulary is unchanged and
+each Kind reads it against its own question — for Diagnosis, whether the cause was found; for
+Adversarial, whether the claim was refuted — stated both in the schema and in each prompt template,
+because the Runner headlines the verdict and an arbitrary one there mislabels the whole Result.)*
+`file`, `line_start` and `line_end` are required but nullable,
 so a finding about the change as a whole is representable without a Worker being able to omit the
 fields; `evidence` is never nullable. The Runner re-checks the payload against these rules on the
 way back rather than trusting the schema to have held — a schema is a request, not a guarantee —
@@ -128,6 +135,33 @@ and follow-ups continue the thread via `codex exec resume`, so dialogue with a r
 Verifiable always starts clean and may pass `--ephemeral`. If a resume attempt fails, the Runner
 falls back to a fresh Delegation and flags `resume_unavailable` in the Result — a visible
 degradation, never a silent one.
+
+*Implemented on #8, with three details the decision did not settle.*
+
+*First, `codex exec resume` is not `codex exec` with an id on the end.* Measured on 0.146.0
+([the resume surface](../research/exec-resume-surface.md)): it takes `--json`, `-c`,
+`--output-schema` and `-o` like its parent, and it takes **neither `-s` nor `-C`** — the two flags
+the Runner is least willing to leave to Codex's defaults. So the sandbox mode travels as
+`-c sandbox_mode=<mode>`, which is validated against the same three values `-s` takes, and the
+working directory travels as the child process's own, because there is no flag for it. The Runner's
+own working directory is still never changed.
+
+*Second, what counts as "a resume attempt failed".* A refused resume produces **no event stream at
+all** — empty stdout, the `thread/resume` error on stderr, exit `1` — because Codex rejects the id
+before the turn begins. The fallback therefore keys off the *absence of a thread*, not off the
+message: no `thread.started`, no payload, no signal, non-zero exit. The stderr line is matched only
+to name the cause in the notice the Orchestrator reads. Deciding on "the run failed" instead would
+re-run a resume that opened a thread and *then* failed, spending a second Delegation on the same
+failure; deciding on the message would break on the first wording change.
+
+*Third, a refused resume plus its fallback is **one** Delegation against the Budget.* The Budget
+counts what was asked of the Worker's provider, and a rollout lookup that fails locally never asks
+it. The Ledger records `resumed` and `resume_unavailable` per Delegation, so how often a persisted
+thread is still resumable — the thing that decides whether Advisory dialogue is actually cheaper —
+is answered from use rather than guessed. The degradation itself is announced on **stdout**, and
+above the findings rather than in the footer: a Forwarder returns stdout verbatim and reads stderr
+only on a non-zero exit, and reading a fresh Result as a continuation of a conversation it does not
+have is the mistake the notice exists to prevent.
 
 ---
 
@@ -220,6 +254,14 @@ a Worker following D6's general instruction will "fix" the failing test and dest
 **C2 — Forwarders carry no schema, prompt, or Codex effort.** D9's original justification claimed
 they would; D16 and D20 moved all three into the Runner. Agents pass `--kind` only.
 
+*Read as "no policy of their own" on #8.* An Advisory Forwarder also passes `--thread <id>` when the
+request names one, which is what makes D11's resume reachable at all — the thread id is in the
+rendering the Orchestrator holds, and a Forwarder that could not pass it back would leave every
+follow-up costing a whole Delegation. It is a continuation id and not a setting: it selects no
+schema, no prompt, no effort and no sandbox mode, and the Runner still resolves all four from
+`--kind`. The asset lint enforces the distinction directly — each Forwarder names exactly one Task
+Kind and carries none of `--output-schema`, `model_reasoning_effort`, `--model` or `--sandbox`.
+
 **C3 — The dedup key is `(Task Kind + prompt + HEAD + thread_id)`.** Without `thread_id` a repeated
 follow-up on a resumed Advisory thread would be served from cache and the thread would never
 advance.
@@ -238,6 +280,28 @@ now — so #10 reuses #8's helper rather than writing a second one.
 Entries are repo-scoped — an identical prompt at an identical `HEAD` in another repository is a
 different question — and only a Result the Runner was willing to render is cached; a failed
 Delegation is one to run again, not one to serve again.
+
+**C3 (widened on #8) — the key is `(Task Kind + prompt + HEAD + thread_id + the uncommitted
+tree)`.** The gap #7 recorded against itself is closed here, in the same edit that made `thread_id`
+real. The measurement is `uncommittedDigest()` in `scripts/budget.mjs`: a content-exact digest over
+everything `HEAD` does not describe — staged and unstaged changes to tracked files, deletions, and
+untracked, non-ignored files. Paths and status codes come from
+`git status --porcelain=v1 -z --untracked-files=all --no-renames`, and content from
+`git hash-object` **without** `-w`, so nothing is written to the user's index, working tree or
+object database to answer a question about a cache key. Seeding a temporary index and calling
+`git write-tree` is shorter and was rejected for exactly that: it writes blobs into the user's
+repository for the plugin's own bookkeeping, and it fails on a repository that is not writable.
+
+A tree that cannot be measured — a directory that is not a repository, a `git` that failed — hashes
+as `null`, which is the pre-#8 behaviour for exactly those cases with the TTL as the only guard. The
+Runner says so on stderr rather than leaving it to be inferred, and only when there *is* a commit,
+so a non-repository is not warned about for lacking a tree it was never going to have. With the
+tree in the key the cache-hit notice loses its caveat: what it now says is that nothing the Worker
+would read has changed, and that anything outside the repository has.
+
+This is the same measurement D21 needs, taken at a different moment and compared against a different
+thing — #10 hashes what a Workspace was *seeded* from and compares it at Landing time against the
+tree as it then is. It reuses this helper rather than writing a second one.
 
 Two further narrowings, both deliberate. Only **Advisory** Results are cached: a Verifiable Result
 names a branch in a **Workspace**, and D22 sweeps Workspaces, so serving one a second time would
@@ -304,8 +368,17 @@ All measured, not assumed. Detail in the research documents.
 - **`$CODEX_HOME` must be writable**, `--ephemeral` or not, or Codex dies before emitting an event.
 - `--output-schema` + `-o <file>` writes the payload already unwrapped; the same payload inside the
   event stream is double-encoded (a JSON string in `agent_message.text`).
+- **`codex exec resume` takes neither `-s` nor `-C`** — the sandbox mode travels as
+  `-c sandbox_mode=<mode>` (validated against the same three values) and the working directory as
+  the child process's own. It does read that directory: outside a repository it refuses with
+  `Not inside a trusted directory` before touching the session store
+  ([the resume surface](../research/exec-resume-surface.md)). *(Implemented on #8.)*
+- **A refused resume produces no event stream at all** — empty stdout, `Error: thread/resume: … no
+  rollout found for thread id <id>` on stderr, exit `1`. It is a run that never began, not a run
+  that went wrong, which is why it costs nothing and why the fallback keys off the absent thread.
 - Never invoke via `npx` — Claude Code's permission wrapper-stripping does not include it.
-- Never `cd` inside a subagent; pass `codex exec -C <dir>`.
+- Never `cd` inside a subagent; pass `codex exec -C <dir>` — except on `resume`, which has no such
+  flag, where the child process's own directory is the only way to carry it.
 
 ---
 

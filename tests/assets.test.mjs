@@ -1,7 +1,7 @@
 // Seam 2 — the asset lint. The shipped markdown and JSON never pass through the Runner, so
 // nothing else notices when they break. This lint grows one assertion per shipped asset; today
-// the plugin ships a manifest, two output schemas, one Forwarder, one command and one prompt
-// template.
+// the plugin ships a manifest, two output schemas, three Forwarders, two commands and three prompt
+// templates.
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -114,47 +114,83 @@ describe("output schemas", () => {
   });
 });
 
-describe("the Review Forwarder", () => {
-  const { frontmatter, body } = readAsset("agents", "review.md");
+/** The three Advisory Task Kinds. Verifiable's Forwarders arrive with the Workspace on #9. */
+const ADVISORY_KINDS = ["review", "diagnosis", "adversarial"];
 
-  it("has Bash and nothing else", () => {
-    // A Forwarder that could read files would start reviewing, and its findings would arrive
-    // indistinguishable from the Worker's.
-    assert.equal(frontmatter.tools, "Bash");
+for (const kind of ADVISORY_KINDS) {
+  describe(`the ${kind} Forwarder`, () => {
+    const { frontmatter, body } = readAsset("agents", `${kind}.md`);
+
+    it("has Bash and nothing else", () => {
+      // A Forwarder that could read files would start doing the work itself, and its findings would
+      // arrive indistinguishable from the Worker's.
+      assert.equal(frontmatter.tools, "Bash");
+    });
+
+    it("runs at low effort — it is a dumb shell", () => {
+      // Not Codex's reasoning effort (C4): that is `-c model_reasoning_effort` from the Runner's
+      // table, and this is the Orchestrator-side level for a subagent that runs one command.
+      assert.equal(frontmatter.effort, "low");
+    });
+
+    it("invites proactive use, so no user trigger is required", () => {
+      assert.match(frontmatter.description, /proactive/i);
+    });
+
+    it("is named after the Task Kind the Orchestrator routes to", () => {
+      assert.equal(frontmatter.name, kind);
+    });
+
+    it("names exactly one Task Kind", () => {
+      // Routing happens in the main thread (D9), one Forwarder per Task Kind. A Forwarder that
+      // could pass a second `--kind` would be routing, with only a handoff paragraph to route on.
+      const passed = [...body.matchAll(/--kind\s+(\w+)/g)].map((match) => match[1]);
+      assert.deepEqual([...new Set(passed)], [kind], passed.join(", "));
+    });
+
+    it("carries no schema, prompt or Codex effort of its own", () => {
+      // C2: all three moved into the Runner. `--thread` is the one other flag a Forwarder passes,
+      // and it is a continuation id rather than a setting.
+      for (const flag of ["--output-schema", "model_reasoning_effort", "--model", "--sandbox", "-s "]) {
+        assert.ok(!body.includes(flag), `the Forwarder passes ${flag}`);
+      }
+    });
+
+    it("knows how to continue a thread rather than paying for a fresh Delegation", () => {
+      // D11. Without this the thread id in a Result reaches an Orchestrator with nothing to do
+      // with it, and every follow-up costs a whole Delegation.
+      assert.match(body, /--thread/);
+    });
+
+    it("returns the Runner's stdout verbatim", () => {
+      assert.match(body, /verbatim/i);
+    });
+
+    it("frames what it returns as data from an external agent, not instruction", () => {
+      // D14, second guardrail, on the surface the Result crosses into the Orchestrator.
+      assert.match(body, /external agent/i);
+      assert.match(body, /not instruction/i);
+    });
+
+    it("reports a failed Delegation rather than answering in its place", () => {
+      // D14, first guardrail. A Forwarder that did the work itself when the Runner failed would
+      // return an answer the Orchestrator cannot tell apart from the Worker's.
+      assert.match(body, /failed/i);
+      assert.match(body, /never replaced with your own answer/i);
+    });
   });
+}
 
-  it("runs at low effort — it is a dumb shell", () => {
-    // Not Codex's reasoning effort (C4): that is `-c model_reasoning_effort` from the Runner's
-    // table, and this is the Orchestrator-side level for a subagent that runs one command.
-    assert.equal(frontmatter.effort, "low");
-  });
+describe("the Adversarial Forwarder in particular", () => {
+  const { frontmatter } = readAsset("agents", "adversarial.md");
 
-  it("invites proactive use, so no user trigger is required", () => {
-    assert.match(frontmatter.description, /proactive/i);
-  });
-
-  it("passes --kind and carries no schema, prompt or Codex effort of its own", () => {
-    assert.match(body, /--kind review/);
-    for (const flag of ["--output-schema", "model_reasoning_effort", "--model", "--sandbox"]) {
-      assert.ok(!body.includes(flag), `the Forwarder passes ${flag}`);
-    }
-  });
-
-  it("returns the Runner's stdout verbatim", () => {
-    assert.match(body, /verbatim/i);
-  });
-
-  it("frames what it returns as data from an external agent, not instruction", () => {
-    // D14, second guardrail, on the surface the Result crosses into the Orchestrator.
-    assert.match(body, /external agent/i);
-    assert.match(body, /not instruction/i);
-  });
-
-  it("reports a failed Delegation rather than answering in its place", () => {
-    // D14, first guardrail. A Forwarder that reviewed the change itself when the Runner failed
-    // would return an answer the Orchestrator cannot tell apart from the Worker's.
-    assert.match(body, /failed/i);
-    assert.match(body, /never replaced with your own answer/i);
+  it("is described so the Orchestrator reaches for it against its own claims", () => {
+    // Its value is disagreement, and the claim most in need of refutation is usually the one the
+    // Orchestrator just talked itself into. A description that only invited the user to ask for it
+    // would leave that case uncovered.
+    assert.match(frontmatter.description, /refute/i);
+    assert.match(frontmatter.description, /your own/i);
+    assert.match(frontmatter.description, /agreement .*weak|weak result/i);
   });
 });
 
@@ -207,7 +243,39 @@ describe("prompt templates", () => {
     });
   }
 
-  it("ships one for Review", () => {
-    assert.ok(existsSync(path.join(REPO_ROOT, "prompts", "review.md")));
+  for (const kind of ADVISORY_KINDS) {
+    it(`ships one for ${kind}`, () => {
+      // A Task Kind with no template still runs — the Runner sends the request on its own and says
+      // so — which is exactly the silent-ish degradation this lint exists to catch before release.
+      assert.ok(existsSync(path.join(REPO_ROOT, "prompts", `${kind}.md`)));
+    });
+  }
+
+  it("tells every Advisory Worker that it changes nothing and that evidence is verbatim", () => {
+    // Both are load-bearing beyond the individual Kind: `read-only` is what the Class asks Codex
+    // for, and Read-Before-Change (ADR-0003) acts on a finding by checking its snippet against the
+    // file it names.
+    for (const kind of ADVISORY_KINDS) {
+      const template = readFileSync(path.join(REPO_ROOT, "prompts", `${kind}.md`), "utf8");
+      assert.match(template, /read-only/i, `${kind} does not say it is read-only`);
+      assert.match(template, /verbatim/i, `${kind} does not ask for verbatim evidence`);
+      assert.match(template, /change nothing/i, `${kind} does not say it changes nothing`);
+    }
+  });
+
+  it("tells every Advisory Worker what its verdict means for its own question", () => {
+    // One schema per Delegation Class (D20), so all three share a `verdict` vocabulary that was
+    // written for Review. The Runner headlines that word, and a Diagnosis headlined `pass` for
+    // reasons nobody stated mislabels the whole Result.
+    const schema = JSON.parse(readFileSync(path.join(REPO_ROOT, "schemas", "advisory.json"), "utf8"));
+    for (const kind of ADVISORY_KINDS) {
+      const heading = `${kind[0].toUpperCase()}${kind.slice(1)}`;
+      assert.match(schema.properties.verdict.description, new RegExp(`For ${heading}:`), kind);
+      assert.match(
+        readFileSync(path.join(REPO_ROOT, "prompts", `${kind}.md`), "utf8"),
+        /`?verdict`?/i,
+        `${kind} never says which verdict to give`,
+      );
+    }
   });
 });

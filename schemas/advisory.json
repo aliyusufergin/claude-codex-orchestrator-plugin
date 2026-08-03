@@ -9,7 +9,7 @@
     "verdict": {
       "type": "string",
       "enum": ["pass", "concerns", "blocking"],
-      "description": "The one-word answer. For Review: `pass` - nothing worth changing; `concerns` - findings worth acting on, none of which should stop the change; `blocking` - at least one finding that should."
+      "description": "The one-word answer, read against the question the Task Kind asked. For Review: `pass` - nothing worth changing; `concerns` - findings worth acting on, none of which should stop the change; `blocking` - at least one finding that should. For Diagnosis: `pass` - the cause is identified and the evidence settles it; `concerns` - a leading hypothesis the evidence does not settle; `blocking` - the cause was not found, so acting on this Result would be guessing. For Adversarial: `pass` - the claim survived the attempt to refute it; `concerns` - it holds only under conditions it did not state; `blocking` - it is refuted."
     },
     "summary": {
       "type": "string",

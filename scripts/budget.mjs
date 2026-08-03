@@ -58,12 +58,20 @@ export function ledgerFile(stateRoot) {
   return path.join(stateRoot, LEDGER_FILE);
 }
 
-/** One `git` invocation, for the Runner's own use. Returns its first line, or null. */
-function gitLine(cwd, args) {
-  const run = spawnSync("git", args, { cwd, encoding: "utf8" });
+/** One `git` invocation, for the Runner's own use. Returns its whole stdout, or null. */
+function git(cwd, args) {
+  // The default `maxBuffer` is 1 MB and a truncated read here would silently change a digest.
+  // Nothing this module runs git for produces more than a list of paths and hashes, so the cap is
+  // generous rather than tuned.
+  const run = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   if (run.status !== 0 || typeof run.stdout !== "string") return null;
-  const line = run.stdout.split("\n")[0].trim();
-  return line === "" ? null : line;
+  return run.stdout;
+}
+
+/** One `git` invocation whose answer is a single line. Returns that line, or null. */
+function gitLine(cwd, args) {
+  const line = git(cwd, args)?.split("\n")[0].trim();
+  return line === undefined || line === "" ? null : line;
 }
 
 /**
@@ -83,18 +91,93 @@ export function repoIdentity(cwd) {
   return { root, head, slug: `${name}-${sha256(root).slice(0, 12)}` };
 }
 
+/** How many paths one `git hash-object` invocation is asked about, so that argv stays under ARG_MAX. */
+const HASH_BATCH = 256;
+
 /**
- * The dedup key: `(Task Kind + prompt + HEAD + thread_id)`, per C3. Without `thread_id` a repeated
- * follow-up on a resumed Advisory thread would be served from cache and the thread would never
- * advance.
+ * A content-exact measurement of everything in the working tree that `HEAD` does not describe:
+ * staged and unstaged changes to tracked files, deletions, and untracked, non-ignored files.
  *
- * `HEAD` is the only thing about the tree in the key, so a Delegation repeated against the same
- * commit with different uncommitted work in it hashes the same. The TTL is what bounds that, and
- * it is why the TTL is short and why a cache hit says how old its Result is.
+ * This exists because `HEAD` alone is a bad answer to "is this the same tree?", and reviewing an
+ * *uncommitted* diff is the plugin's first use. Two Delegations at the same commit with different
+ * uncommitted work in them are different questions, and before this they hashed the same.
+ *
+ * Read-only by construction. Paths and status codes come from `git status`, and content comes from
+ * `git hash-object` *without* `-w` — so nothing is written to the user's index, working tree or
+ * object database to answer a question about a cache key. The alternative, seeding a temporary
+ * index and calling `git write-tree`, is shorter and writes blobs into the user's repository for
+ * bookkeeping that is none of its business.
+ *
+ * Returns `null` when the measurement could not be taken at all — not a repository, or a `git` that
+ * failed. A null is not a clean tree: a clean tree has a digest like any other, and the caller has
+ * to be able to tell "nothing has changed" from "nothing was measured".
  */
-export function dedupKey({ kind, request, head, thread }) {
+export function uncommittedDigest(cwd) {
+  const root = gitLine(cwd, ["rev-parse", "--show-toplevel"]);
+  if (root === null) return null;
+
+  // `--porcelain=v1 -z` is the stable, unquoted, repo-root-relative form. `--no-renames` keeps every
+  // entry one path, which is all this needs — a rename is a deletion and an addition to a digest.
+  const status = git(root, [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+    "--no-renames",
+  ]);
+  if (status === null) return null;
+
+  // `XY PATH`, NUL-terminated. The code matters as well as the path: a file deleted and a file
+  // emptied both have no content to hash, and they are not the same working tree.
+  const entries = status
+    .split("\0")
+    .filter((entry) => entry !== "")
+    .map((entry) => ({ code: entry.slice(0, 2), path: entry.slice(3) }));
+
+  // Only a regular file has content to hash. A deleted path, a broken symlink and a dirty submodule
+  // are all recorded by their status code and path alone — asking `git hash-object` for any of them
+  // would fail the whole measurement over an entry the status line already describes.
+  const readable = entries.filter((entry) => {
+    try {
+      return statSync(path.join(root, entry.path)).isFile();
+    } catch {
+      return false;
+    }
+  });
+  const contents = [];
+  for (let at = 0; at < readable.length; at += HASH_BATCH) {
+    const batch = readable.slice(at, at + HASH_BATCH);
+    // No `-w`: this hashes and prints, and writes nothing.
+    const hashed = git(root, ["hash-object", "--", ...batch.map((entry) => entry.path)]);
+    if (hashed === null) return null;
+    const lines = hashed.split("\n").filter((line) => line.trim() !== "");
+    // One hash per path or the pairing is wrong, and a wrong pairing is a digest that is stable
+    // across two different trees — the one failure this helper exists to prevent.
+    if (lines.length !== batch.length) return null;
+    batch.forEach((entry, index) => contents.push([entry.path, lines[index]]));
+  }
+
   return sha256(
-    JSON.stringify([kind, request, head ?? null, thread ?? null]),
+    JSON.stringify([entries.map((entry) => [entry.code, entry.path]), contents]),
+  ).slice(0, KEY_CHARS);
+}
+
+/**
+ * The dedup key: `(Task Kind + prompt + HEAD + thread_id + the uncommitted tree)`.
+ *
+ * C3 specified the first four. The fifth was added on #8 for the reason C3 recorded against itself:
+ * `HEAD` is the only thing about the tree in those four, so a Delegation repeated against the same
+ * commit with different uncommitted work in it hashed the same and was served a stale Result — and
+ * reviewing an uncommitted diff is the plugin's first use, with the TTL its only guard. `thread_id`
+ * became real on the same issue, which is why the key was edited once rather than twice.
+ *
+ * `null` for the tree is what a directory that is not a repository, or one whose tree could not be
+ * measured, hashes as. That is the pre-#8 behaviour for exactly those cases, and the TTL is again
+ * the only guard — so the Runner says so rather than leaving it to be inferred.
+ */
+export function dedupKey({ kind, request, head, thread, tree }) {
+  return sha256(
+    JSON.stringify([kind, request, head ?? null, thread ?? null, tree ?? null]),
   ).slice(0, KEY_CHARS);
 }
 
