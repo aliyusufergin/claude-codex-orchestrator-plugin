@@ -7,15 +7,17 @@
 //   1  the Delegation failed
 //   2  the invocation was wrong
 //
-// The Delegation Budget, dedup and the Workspace land on top of this in later work. The Worker
-// process contract — sandbox-mode selection (ADR-0004) and the environment allowlist — is here, as
-// is the Advisory path end to end: prompt template, output schema, reasoning effort, persistence,
-// event-stream reconciliation, and the compact rendering the Orchestrator gets.
+// The Workspace lands on top of this in later work. The Worker process contract — sandbox-mode
+// selection (ADR-0004) and the environment allowlist — is here, as is the Advisory path end to end:
+// prompt template, output schema, reasoning effort, persistence, event-stream reconciliation, and
+// the compact rendering the Orchestrator gets. So is the bound of ADR-0002: the Delegation Budget
+// and the dedup cache, enforced here rather than in any agent or command prompt.
 //
 // Environment variables the Runner reads for itself. None reaches the Worker unless the user
-// puts it on the allowlist by name.
+// puts it on the allowlist by name. The four numbers the plugin enforces have their own
+// environment variables, listed in `config.mjs`.
 //   DELEGATE_ENV_ALLOWLIST   extra names or `PREFIX*` globs added to the Worker's environment
-//   DELEGATE_STATE_DIR       where Results are persisted, overriding the default
+//   DELEGATE_STATE_DIR       where Results, the Budget ledger and the dedup cache live
 //   DELEGATE_CODEX_BIN       the Codex binary, for the test seam
 //   DELEGATE_SANDBOXED       `1`/`0` short-circuits outer-sandbox detection, for the test seam —
 //                            detection is a measurement, and this is not a way to configure it
@@ -37,6 +39,16 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
+import {
+  budgetState,
+  cacheLookup,
+  cacheStore,
+  dedupKey,
+  record,
+  repoIdentity,
+} from "./budget.mjs";
+import { SETTINGS, readSettings, writeSetting } from "./config.mjs";
+
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMA_DIR = path.join(PLUGIN_ROOT, "schemas");
 const PROMPT_DIR = path.join(PLUGIN_ROOT, "prompts");
@@ -45,8 +57,9 @@ const EXIT_OK = 0;
 const EXIT_FAILED = 1;
 const EXIT_USAGE = 2;
 
-const USAGE = `usage: runner.mjs delegate --kind <kind> --prompt <text|-> [--cwd <dir>]
-       runner.mjs result <id>`;
+const USAGE = `usage: runner.mjs delegate --kind <kind> --prompt <text|-> [--cwd <dir>] [--thread <id>]
+       runner.mjs result <id>
+       runner.mjs quota [<new-ceiling>]`;
 
 /**
  * Task Kind to Delegation Class. The Class is what picks the sandbox mode, so a Task Kind that
@@ -645,14 +658,84 @@ async function runCodex({ prompt, cwd, sandbox, schema, delegationClass, extraAr
 }
 
 /**
- * Where Results live. `$CLAUDE_PLUGIN_DATA` is the harness's persistent directory and survives
- * plugin updates, which `${CLAUDE_PLUGIN_ROOT}` explicitly does not — but the Runner is also invoked
+ * Where the plugin's own state lives: Results, the Budget ledger, the dedup cache and the user's
+ * settings. `$CLAUDE_PLUGIN_DATA` is the harness's persistent directory and survives plugin
+ * updates, which `${CLAUDE_PLUGIN_ROOT}` explicitly does not — but the Runner is also invoked
  * outside a plugin install, and under an outer sandbox `$HOME` is not writable. `$CODEX_HOME` is,
  * because a Delegation has already failed by then if it is not, so it is the fallback.
+ *
+ * All of it is outside any repository. That is required of the Budget, which is the Worker's
+ * provider's and spans every repository the user works in, and it is what keeps a Worker's Result
+ * out of the user's source tree.
  */
-function resultsDir() {
+function stateRoot() {
   const configured = process.env.DELEGATE_STATE_DIR?.trim() || process.env.CLAUDE_PLUGIN_DATA?.trim();
-  return path.join(configured ? path.resolve(configured) : path.join(codexHome(), "delegate"), "results");
+  return configured ? path.resolve(configured) : path.join(codexHome(), "delegate");
+}
+
+function resultsDir() {
+  return path.join(stateRoot(), "results");
+}
+
+/** The two numbers the Budget is bounded by, out of the settings table that holds them. */
+const budgetLimits = (settings) => ({
+  ceiling: settings.budget_ceiling,
+  windowHours: settings.budget_window_hours,
+});
+
+/** Anything the Runner has to say for itself, on the channel that is diagnostic by contract. */
+function warn(message) {
+  process.stderr.write(`${message}\n`);
+}
+
+/**
+ * Why a Delegation was refused, in the Runner's own words. The Runner cannot ask the user to raise
+ * the ceiling — `AskUserQuestion` is unavailable to every subagent, and a Forwarder is where this
+ * text lands — so the refusal has to carry the count, the ceiling, when the window frees up and
+ * the one command that changes any of it.
+ */
+function budgetRefusal(state) {
+  const frees =
+    state.resets_at === null
+      ? ""
+      : ` The oldest of them ages out at ${state.resets_at}, which is when the next Delegation has room.`;
+  return (
+    `the Delegation Budget is exhausted: ${state.count} Delegations started in the last ` +
+    `${state.windowHours}h, and the ceiling is ${state.ceiling}. Nothing was delegated.${frees}` +
+    " Raise the ceiling with `/delegate:quota <n>` if this window's work is worth it — that is the" +
+    " one place this bound is negotiable."
+  );
+}
+
+/** The Budget as `/delegate:quota` shows it, settings and all. */
+function renderQuota({ state, values, sources, root }) {
+  const out = [
+    `Delegation Budget — ${state.count} of ${state.ceiling} Delegations in the last ` +
+      `${state.windowHours}h, ${state.remaining} left.`,
+  ];
+  if (state.resets_at !== null) {
+    out.push(
+      `The window is rolling: the oldest of them ages out at ${state.resets_at}, and that is when` +
+        " the next one frees up.",
+    );
+  }
+
+  out.push(
+    "",
+    "The numbers in force. Every one of them is provisional — they are to be calibrated against",
+    "real runs, not guessed, and the Runner's ledger records what that calibration needs:",
+  );
+  const width = Math.max(...Object.values(SETTINGS).map((spec) => spec.label.length));
+  for (const [key, spec] of Object.entries(SETTINGS)) {
+    out.push(`  ${spec.label.padEnd(width)}  ${spec.format(values[key]).padEnd(12)}  ${sources[key]}`);
+  }
+
+  out.push(
+    "",
+    `Budget state is provider-wide and lives at ${root}, outside any repository; dedup entries are`,
+    "repo-scoped beneath it. Raise the ceiling with `/delegate:quota <n>`.",
+  );
+  return `${out.join("\n")}\n`;
 }
 
 /**
@@ -861,6 +944,10 @@ async function delegate(args) {
         kind: { type: "string" },
         prompt: { type: "string" },
         cwd: { type: "string" },
+        // The Advisory thread this Delegation continues. Resuming one is #8's; today the id is
+        // read for the dedup key alone, where C3 requires it — without it a repeated follow-up on
+        // a resumed thread would be served from cache and the thread would never advance.
+        thread: { type: "string" },
       },
     }));
   } catch (error) {
@@ -880,6 +967,39 @@ async function delegate(args) {
   const request = readPrompt(values.prompt);
   const cwd = path.resolve(values.cwd ?? process.cwd());
   if (!existsSync(cwd)) throw usageError(`--cwd is not a directory: ${cwd}`);
+  const thread = values.thread?.trim() || null;
+
+  const root = stateRoot();
+  const { values: settings } = readSettings(root, { warn });
+  const repo = repoIdentity(cwd);
+  const key = dedupKey({ kind: values.kind, request, head: repo.head, thread });
+
+  // The dedup cache is consulted before anything that costs, and before the checks that decide
+  // whether Codex could even run: serving a Result the Runner already has needs no Worker.
+  const cached = cacheLookup(root, repo.slug, key, settings.dedup_ttl_minutes);
+  if (cached) {
+    // On stdout, not stderr. A Forwarder returns stdout verbatim and reads stderr only when the
+    // Runner exits non-zero, so a staleness notice on stderr would reach nobody at all — and this
+    // is the one thing about a cached Result the Orchestrator has to know before acting on it.
+    process.stdout.write(
+      `${cached.stdout}\n_Served from the dedup cache: an identical Delegation — same Task Kind,` +
+        ` prompt, HEAD and thread — returned this Result ${cached.age_minutes.toFixed(1)} minutes` +
+        " ago, so no Delegation was spent. `HEAD` is the only thing about the tree in the key, so" +
+        " if the working tree has changed since, this Result is that much out of date._\n",
+    );
+    // Best-effort: a cache hit is calibration data, not a bound, and losing the note costs nothing.
+    try {
+      record(root, { event: "cached", id: cached.id, kind: values.kind, repo: repo.slug, key });
+    } catch {
+      // The cache still served the Result, which is the part the user is waiting for.
+    }
+    return;
+  }
+
+  // The Budget, second: refusing costs the user nothing and must not depend on Codex being
+  // startable. It is read before the Delegation and counted at its start, further down.
+  const budget = budgetState(root, budgetLimits(settings));
+  if (budget.exhausted) throw failed(budgetRefusal(budget));
 
   // A precondition for every Delegation, `--ephemeral` or not: with `$CODEX_HOME` read-only,
   // `codex exec` dies at app-server startup before emitting a single event. It fails at a
@@ -898,74 +1018,191 @@ async function delegate(args) {
     process.stderr.write(`leaving model_reasoning_effort to ${deferredTo}\n`);
   }
 
-  const { payload: raw, failure } = await runCodex({
-    prompt: composePrompt(values.kind, request),
-    cwd,
-    sandbox: mode,
-    schema: SCHEMA_BY_CLASS[delegationClass],
-    delegationClass,
-    extraArgs: effortArgs,
-  });
+  // An Advisory Delegation blocks, so what it returns is the Result itself and not a job id. Its
+  // id is minted here rather than after the run, because the Budget counts a Delegation at its
+  // start and the two halves of one observation have to name the same thing.
+  const id = `${values.kind}-${randomBytes(4).toString("hex")}`;
 
-  // An Advisory Delegation blocks, so what it returns is the Result itself and not a job id. What
-  // came back is persisted before it is parsed, checked or rendered: the Budget for it is already
-  // spent, and the Result the Runner will not render is exactly the one worth being able to read.
-  const record = {
-    id: `${values.kind}-${randomBytes(4).toString("hex")}`,
-    kind: values.kind,
-    class: delegationClass,
-    created_at: new Date().toISOString(),
-    cwd,
-    sandbox: mode,
-    reasoning_effort: level ?? null,
-    request,
-    payload: null,
-  };
-  // A reconciliation failure is part of the Result, not a footnote to it: the payload below is the
-  // Result the Worker claimed, and this is the reason it is not one.
-  if (failure) record.failure = failure;
+  // The count, immediately before the spawn. At start rather than at completion, so that work
+  // outliving its session still counts — and a Delegation that fails after the provider was asked
+  // counts too, because the provider was asked.
+  try {
+    record(root, {
+      event: "started",
+      id,
+      kind: values.kind,
+      class: delegationClass,
+      repo: repo.slug,
+      head: repo.head,
+      thread,
+      key,
+    });
+  } catch (error) {
+    // The ledger is the Budget. A Budget that cannot be counted cannot be enforced, and running
+    // unbounded is the one outcome ADR-0002 exists to prevent — so this refuses instead.
+    throw failed(
+      `the Delegation Budget cannot be counted, so it cannot be enforced: ${error.message}` +
+        " — nothing was delegated",
+    );
+  }
 
-  let parseError;
-  if (raw !== null && raw.trim() !== "") {
+  const startedAt = Date.now();
+  /**
+   * The other half of the observation: what the Delegation cost. Best-effort, because the start is
+   * what the Budget counts and this is only what calibration reads.
+   */
+  const observe = (outcome, extra = {}) => {
     try {
-      record.payload = JSON.parse(raw);
+      record(root, {
+        event: "finished",
+        id,
+        kind: values.kind,
+        outcome,
+        duration_ms: Date.now() - startedAt,
+        // Advisory produces no diff. Present and null rather than absent, so that calibration can
+        // tell "no diff" from "not recorded" once #9 lands the Verifiable path.
+        diff_lines: null,
+        ...extra,
+      });
+    } catch {
+      // Nothing here is load-bearing for this Delegation or the next one.
+    }
+  };
+
+  let rendered;
+  try {
+    const { payload: raw, failure } = await runCodex({
+      prompt: composePrompt(values.kind, request),
+      cwd,
+      sandbox: mode,
+      schema: SCHEMA_BY_CLASS[delegationClass],
+      delegationClass,
+      extraArgs: effortArgs,
+    });
+
+    // What came back is persisted before it is parsed, checked or rendered: the Budget for it is
+    // already spent, and the Result the Runner will not render is exactly the one worth being able
+    // to read.
+    const resultRecord = {
+      id,
+      kind: values.kind,
+      class: delegationClass,
+      created_at: new Date().toISOString(),
+      cwd,
+      sandbox: mode,
+      reasoning_effort: level ?? null,
+      thread,
+      request,
+      payload: null,
+    };
+    // A reconciliation failure is part of the Result, not a footnote to it: the payload below is
+    // the Result the Worker claimed, and this is the reason it is not one.
+    if (failure) resultRecord.failure = failure;
+
+    let parseError;
+    if (raw !== null && raw.trim() !== "") {
+      try {
+        resultRecord.payload = JSON.parse(raw);
+      } catch (error) {
+        // The unparseable text is the whole evidence of what went wrong, so it is kept in the
+        // Result under its own name rather than dropped for not fitting `payload`.
+        resultRecord.raw_payload = raw;
+        parseError = error;
+      }
+    }
+
+    const persisted = persistResult(resultRecord);
+    const readable = persisted ? ` — it is at \`/delegate:result ${id}\`` : "";
+
+    // D14, first guardrail: a failed Delegation is reported as a failure and work stops. Nothing is
+    // rendered, so there is nothing for the Orchestrator to mistake for an answer.
+    if (failure) throw failed(`${renderFailure(failure)}${readable}`);
+
+    if (parseError) {
+      throw failed(`codex exec wrote a payload that is not JSON: ${parseError.message}${readable}`);
+    }
+
+    if (delegationClass !== "advisory") {
+      // The Verifiable rendering arrives with the Workspace on #9. Until then its payload goes out
+      // as it came back, byte for byte.
+      rendered = raw.endsWith("\n") ? raw : `${raw}\n`;
+    } else {
+      const { fatal, noted } = advisoryProblems(resultRecord.payload);
+      if (fatal.length > 0) {
+        throw failed(
+          `the Worker's Result is not a usable Advisory Result: ${fatal.join("; ")}${readable}`,
+        );
+      }
+      // Reported rather than refused: the rendering below survives every one of these, and the
+      // Orchestrator is told what the Worker got wrong on the way past.
+      if (noted.length > 0) {
+        warn(`the Worker's Result departs from the Advisory schema: ${noted.join("; ")}`);
+      }
+      rendered = renderAdvisory({ ...resultRecord, persisted });
+    }
+  } catch (error) {
+    observe("failed");
+    throw error;
+  }
+
+  observe("ok", { rendered_bytes: Buffer.byteLength(rendered) });
+  // Only a Result the Runner was willing to render is cached, and only an Advisory one. A failed
+  // Delegation is not an answer to serve again — it is one to run again, if the Orchestrator still
+  // wants it. And a Verifiable Result is a branch in a Workspace (D11, D22): serving it a second
+  // time would point the Orchestrator at work that may since have been Landed or swept, which is
+  // worse than spending the Delegation. #9 decides what dedup means once a Workspace exists.
+  if (delegationClass === "advisory") {
+    cacheStore(
+      root,
+      repo.slug,
+      key,
+      { id, kind: values.kind, stdout: rendered },
+      settings.dedup_ttl_minutes,
+    );
+  }
+  process.stdout.write(rendered);
+}
+
+/**
+ * `/delegate:quota` — the Budget as it stands, and the one place its ceiling is negotiable. The
+ * numbers it prints are `config.mjs`'s, read rather than restated, so that raising one here and
+ * enforcing it there cannot drift apart.
+ */
+function quota(args) {
+  // An empty argument is no argument: `/delegate:quota` with nothing after it can reach the Runner
+  // as one empty string, and that must show the Budget rather than set its ceiling to nothing.
+  const [ceiling, ...rest] = args.filter((arg) => arg.trim() !== "");
+  if (rest.length > 0) throw usageError(`unexpected argument: ${rest[0]}`);
+  const root = stateRoot();
+
+  if (ceiling !== undefined) {
+    // A ceiling that is not a number is a wrong invocation; a ceiling that cannot be saved is a
+    // failed one. They exit differently because they are the user's to fix differently.
+    const spec = SETTINGS.budget_ceiling;
+    if (spec.parse(ceiling) === null) {
+      throw usageError(`not a Budget ceiling: ${ceiling} — expected ${spec.expects}`);
+    }
+    try {
+      writeSetting(root, "budget_ceiling", ceiling);
     } catch (error) {
-      // The unparseable text is the whole evidence of what went wrong, so it is kept in the Result
-      // under its own name rather than dropped for not fitting `payload`.
-      record.raw_payload = raw;
-      parseError = error;
+      throw failed(`could not save the ceiling to ${root}: ${error.message}`);
     }
   }
 
-  const persisted = persistResult(record);
-  const readable = persisted ? ` — it is at \`/delegate:result ${record.id}\`` : "";
-
-  // D14, first guardrail: a failed Delegation is reported as a failure and work stops. Nothing is
-  // rendered, so there is nothing for the Orchestrator to mistake for an answer.
-  if (failure) throw failed(`${renderFailure(failure)}${readable}`);
-
-  if (parseError) {
-    throw failed(`codex exec wrote a payload that is not JSON: ${parseError.message}${readable}`);
+  const { values, sources } = readSettings(root, { warn });
+  if (ceiling !== undefined) {
+    // What was saved and what is in force are two different things: the environment wins over the
+    // saved settings, so a user who raised the ceiling with `$DELEGATE_BUDGET_CEILING` set would
+    // otherwise be told the bound moved when it did not.
+    warn(
+      sources.budget_ceiling === `$${SETTINGS.budget_ceiling.env}`
+        ? `the saved Delegation Budget ceiling is now ${ceiling}, but ${sources.budget_ceiling} is` +
+            ` set and overrides it: ${values.budget_ceiling} per window is what is in force`
+        : `the Delegation Budget ceiling is now ${values.budget_ceiling} per window`,
+    );
   }
-
-  if (delegationClass !== "advisory") {
-    // The Verifiable rendering arrives with the Workspace on #9. Until then its payload goes out
-    // as it came back, byte for byte.
-    process.stdout.write(raw.endsWith("\n") ? raw : `${raw}\n`);
-    return;
-  }
-
-  const { fatal, noted } = advisoryProblems(record.payload);
-  if (fatal.length > 0) {
-    throw failed(`the Worker's Result is not a usable Advisory Result: ${fatal.join("; ")}${readable}`);
-  }
-  // Reported rather than refused: the rendering below survives every one of these, and the
-  // Orchestrator is told what the Worker got wrong on the way past.
-  if (noted.length > 0) {
-    process.stderr.write(`the Worker's Result departs from the Advisory schema: ${noted.join("; ")}\n`);
-  }
-
-  process.stdout.write(renderAdvisory({ ...record, persisted }));
+  const state = budgetState(root, budgetLimits(values));
+  process.stdout.write(renderQuota({ state, values, sources, root }));
 }
 
 /**
@@ -995,6 +1232,8 @@ async function main() {
       return delegate(rest);
     case "result":
       return result(rest);
+    case "quota":
+      return quota(rest);
     case undefined:
       throw usageError("no subcommand given");
     default:
