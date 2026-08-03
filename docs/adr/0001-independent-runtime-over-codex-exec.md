@@ -34,8 +34,10 @@ runs for minutes.
 
 We own the transport, including three undocumented behaviours found by measurement and easy to
 regress on. `codex exec` hangs forever if it inherits an open stdin. It writes unrelated MCP
-client errors to stderr, so stderr is not a failure signal. And it can exit `0` while its work
-failed outright — observed during the [sandbox probe](../research/sandbox-nesting-probe.md), where
-a Worker emitted `file_change` events, claimed success, and wrote nothing. Neither the exit code
-nor stderr can be trusted alone: the Runner reconciles the JSONL event stream against the Worker's
-own claims, and this is what a Verification Signal actually rests on.
+client errors to stderr, so stderr on its own is not a failure signal. And it can exit `0` while
+its work failed outright — observed during the [sandbox probe](../research/sandbox-nesting-probe.md),
+where a Worker emitted `file_change` events, claimed success, and wrote nothing. Neither the exit
+code nor stderr can be trusted alone: the Runner reads a failed turn, a failed tool call and the
+Worker's closing claim off the JSONL event stream, matches the one tool-router signature that
+probe case C put on stderr and nowhere else, and reconciles the two against each other. This is
+what a Verification Signal actually rests on.

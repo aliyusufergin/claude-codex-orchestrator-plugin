@@ -7,10 +7,10 @@
 //   1  the Delegation failed
 //   2  the invocation was wrong
 //
-// The Delegation Budget, dedup, the Workspace and event-stream reconciliation land on top of this
-// in later work. The Worker process contract — sandbox-mode selection (ADR-0004) and the
-// environment allowlist — is here, as is the Advisory path end to end: prompt template, output
-// schema, reasoning effort, persistence, and the compact rendering the Orchestrator gets.
+// The Delegation Budget, dedup and the Workspace land on top of this in later work. The Worker
+// process contract — sandbox-mode selection (ADR-0004) and the environment allowlist — is here, as
+// is the Advisory path end to end: prompt template, output schema, reasoning effort, persistence,
+// event-stream reconciliation, and the compact rendering the Orchestrator gets.
 //
 // Environment variables the Runner reads for itself. None reaches the Worker unless the user
 // puts it on the allowlist by name.
@@ -97,6 +97,20 @@ const RESULT_ID = /^[a-z]+-[0-9a-f]{8}$/;
 
 /** How much of one finding's `evidence` the compact rendering carries before it points at the file. */
 const EVIDENCE_MAX_LINES = 40;
+
+/** How much of a Worker's own text a one-line quotation of it carries. */
+const ONE_LINE_MAX_CHARS = 120;
+
+/** How much of the Worker's closing claim a reconciliation failure quotes back. */
+const CLAIM_MAX_CHARS = 240;
+
+/**
+ * The one stderr signature that is a failure signal rather than noise: Codex's tool router
+ * reporting that a tool call it dispatched failed. Probe case C put the whole trace of a silent
+ * failure here and nowhere else, while the same channel carried unrelated MCP client errors on
+ * every run — so this is matched by name, and nothing else on stderr is read as failure.
+ */
+const TOOL_ROUTER_ERROR = /codex_core::tools::router/;
 
 const SANDBOX_BY_CLASS = {
   advisory: "read-only",
@@ -332,24 +346,204 @@ function reasoningEffort(kind, cwd) {
   };
 }
 
-function spawnCodex(args) {
+function spawnCodex(args, watcher) {
   return new Promise((resolve) => {
     const child = spawn(codexBinary(), args, {
       cwd: process.cwd(),
       env: workerEnv(),
       // stdin is /dev/null: `codex exec` reads it to EOF before starting the turn, so an
-      // inherited open stdin hangs it forever. stderr passes straight through as diagnostic
-      // output — unrelated MCP client errors land there on every run, so it is never read as a
-      // failure signal. stdout carries the JSONL event stream, which nothing consumes yet.
-      stdio: ["ignore", "ignore", "inherit"],
+      // inherited open stdin hangs it forever. stdout carries the JSONL event stream, which the
+      // watcher reads and nothing forwards — what reaches the Orchestrator is the rendering.
+      // stderr is piped rather than inherited so the watcher can look at it too, and every byte
+      // of it is passed straight through unchanged, because it is still diagnostic output.
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => watcher.stdout(chunk));
+    child.stderr.on("data", (chunk) => {
+      process.stderr.write(chunk);
+      watcher.stderr(chunk);
     });
     child.on("error", (error) => resolve({ spawnError: error }));
+    // `close` rather than `exit`: it fires once the two pipes are drained, so nothing the Worker
+    // said is still in flight when the watcher is asked what it saw.
     child.on("close", (code, signal) => resolve({ code, signal }));
   });
 }
 
+/** A Worker's text on one line, collapsed and capped — for the places the Runner quotes it inline. */
+function oneLine(value, max = ONE_LINE_MAX_CHARS) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** Whatever an event carries as its message, as one line — a string, or the object it hid in. */
+function messageOf(value) {
+  if (typeof value === "string") return oneLine(value);
+  if (value && typeof value === "object") {
+    const message = value.message ?? value.error ?? value.reason;
+    if (typeof message === "string") return oneLine(message);
+    return oneLine(JSON.stringify(value));
+  }
+  return oneLine(String(value));
+}
+
 /**
- * Run one `codex exec` and return the payload it wrote, or the reason it produced none.
+ * The Worker's closing claim, as a line worth quoting back at it.
+ *
+ * With `--output-schema` the closing message is the payload itself, double-encoded — so the claim
+ * a reconciliation failure should quote is the Worker's own verdict and summary, not the JSON they
+ * arrived in. A message that is not a payload is the claim as it stands.
+ */
+function workerClaim(text) {
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return oneLine(text, CLAIM_MAX_CHARS);
+  }
+  if (payload === null || typeof payload !== "object") return oneLine(text, CLAIM_MAX_CHARS);
+
+  const spoken = [payload.verdict, payload.summary].filter(
+    (field) => typeof field === "string" && field.trim() !== "",
+  );
+  return oneLine(spoken.length > 0 ? spoken.join(" — ") : text, CLAIM_MAX_CHARS);
+}
+
+/**
+ * Watches one Codex run for the failures its exit code does not carry.
+ *
+ * Measured, not hypothetical (probe case C): Codex emitted `file_change` events, claimed success
+ * in its final message, exited `0`, and wrote nothing. Neither channel is trustworthy on its own —
+ * the exit code said success, and stderr carries unrelated MCP client noise on every run — so both
+ * are read here and reconciled against the Worker's own claim, and the failure names both halves.
+ *
+ * The two channels carry different things. The event stream is where a failed turn, a failed tool
+ * call and the Worker's closing claim appear. The tool-router error is matched on stderr, by name,
+ * because that is where probe case C put the whole trace of a silent failure — one signature, not
+ * "stderr said something".
+ *
+ * A tool-router error is treated as a failed Delegation even if the Worker went on to work around
+ * it. That is deliberate: a Worker that recovered will be delegated again at the cost of one
+ * Delegation, whereas a fabricated Result accepted as real costs the user their code.
+ */
+function watchRun() {
+  const failures = [];
+  let claim = null;
+  let stdoutRest = "";
+  let stderrRest = "";
+
+  const note = (failure) => {
+    if (!failures.includes(failure)) failures.push(failure);
+  };
+
+  function readEvent(line) {
+    if (line.trim() === "") return;
+
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      // A line that is not JSON is not evidence of anything. `--json` is documented as JSONL, and
+      // a build that prints one banner on stdout must not turn every run into a failure.
+      return;
+    }
+    if (event === null || typeof event !== "object") return;
+
+    if (event.type === "error") {
+      note(`the run reported an error: ${messageOf(event)}`);
+      return;
+    }
+    if (event.type === "turn.failed") {
+      note(`the turn failed: ${messageOf(event.error ?? event)}`);
+      return;
+    }
+    if (!["item.started", "item.updated", "item.completed"].includes(event.type)) return;
+
+    const item = event.item;
+    if (item === null || typeof item !== "object") return;
+    // The item's details are a tagged union, flattened onto the item in the shape `codex exec`
+    // emits today and nested under `details` in the shape its own types describe.
+    const detail = item.details && typeof item.details === "object" ? item.details : item;
+
+    if (detail.type === "agent_message") {
+      // The Worker's own closing claim — the thing a failure signal is reconciled against.
+      if (typeof detail.text === "string" && detail.text.trim() !== "") claim = detail.text;
+      return;
+    }
+    if (detail.type === "error") {
+      note(`a tool call failed: ${messageOf(detail)}`);
+      return;
+    }
+    // A command the Worker ran that exited non-zero is work, not failure: a Review runs `git diff`
+    // against refs that may not exist, and a Repro's whole point is a test that fails. Every other
+    // kind of item reporting `failed` is a tool call that did not happen at all.
+    if (item.status === "failed" && detail.type !== "command_execution") {
+      note(`a ${detail.type ?? "tool"} call failed: ${messageOf(detail)}`);
+    }
+  }
+
+  function readDiagnostic(line) {
+    if (TOOL_ROUTER_ERROR.test(line)) note(`Codex's tool router reported an error: ${oneLine(line)}`);
+  }
+
+  const feed = (rest, chunk, consume) => {
+    const lines = (rest + chunk).split("\n");
+    // The last element is whatever came after the final newline: a partial line, held for the
+    // chunk that completes it.
+    const tail = lines.pop();
+    for (const line of lines) consume(line);
+    return tail;
+  };
+
+  return {
+    stdout(chunk) {
+      stdoutRest = feed(stdoutRest, chunk, readEvent);
+    },
+    stderr(chunk) {
+      stderrRest = feed(stderrRest, chunk, readDiagnostic);
+    },
+    /**
+     * What this run showed to have failed, or `null` if nothing in it says anything did. Kept as
+     * its parts rather than as a sentence, because it is persisted into the Result and the
+     * Orchestrator should be able to read it without parsing prose. `outcome` describes how the
+     * process ended, in the caller's words.
+     */
+    failure(outcome) {
+      readEvent(stdoutRest);
+      readDiagnostic(stderrRest);
+      stdoutRest = "";
+      stderrRest = "";
+      if (failures.length === 0) return null;
+
+      return { codex: outcome, failures: [...failures], claim: claim === null ? null : workerClaim(claim) };
+    },
+  };
+}
+
+/**
+ * A reconciliation failure as the one line the Orchestrator reads. Naming what the run showed
+ * against what the Worker claimed is the point: "the Delegation failed" on its own leaves the
+ * Orchestrator unable to tell a fabricated Result from a transport that is simply down.
+ *
+ * The claim is quoted rather than restated, because it is the Worker's text and travels under D14's
+ * second guardrail like any other Result text.
+ */
+function renderFailure({ codex, failures, claim }) {
+  const claimed =
+    claim === null
+      ? "the Worker made no closing claim"
+      : `the Worker's own closing claim, quoted: ${JSON.stringify(claim)}`;
+  // Each entry names the channel it came from, so the exit code is reported as the evidence it is
+  // rather than as the thing that decided.
+  return `the Delegation failed (codex exec ${codex}): ${failures.join("; ")} — ${claimed}`;
+}
+
+/**
+ * Run one `codex exec` and return `{ payload, failure }`: the payload it wrote, and the reason the
+ * run is a failed Delegation despite having produced one. A run that failed without writing
+ * anything at all throws instead — there is nothing to persist and nothing to reconcile.
  *
  * `--output-schema` plus `-o <file>` writes the payload already unwrapped, while the copy in the
  * event stream's `agent_message.text` is double-encoded — so the file is the source.
@@ -384,17 +578,27 @@ async function runCodex({ prompt, cwd, sandbox, schema, extraArgs = [] }) {
   ];
 
   try {
-    const { code, signal, spawnError } = await spawnCodex(args);
+    const watcher = watchRun();
+    const { code, signal, spawnError } = await spawnCodex(args, watcher);
 
+    // A spawn failure is not a run: there is no stream, no claim and nothing to reconcile.
     if (spawnError) throw failed(`could not run ${codexBinary()}: ${spawnError.message}`);
-    if (signal) throw failed(`codex exec was killed by ${signal}`);
-    if (code !== 0) throw failed(`codex exec exited ${code}`);
-    if (!existsSync(outputFile)) throw failed("codex exec wrote no payload");
 
-    const payload = readFileSync(outputFile, "utf8");
+    // The reconciliation is read before the exit code and before the signal, because how the
+    // process ended is the weaker evidence of the two: a run that failed and exited `0` is the case
+    // this exists for, and a run that died is better described by what it showed than by the number
+    // or the signal that ended it.
+    const failure = watcher.failure(signal ? `was killed by ${signal}` : `exited ${code}`);
+    if (signal) throw failed(failure ? renderFailure(failure) : `codex exec was killed by ${signal}`);
+
+    const payload = existsSync(outputFile) ? readFileSync(outputFile, "utf8") : null;
+    if (failure) return { payload, failure };
+
+    if (code !== 0) throw failed(`codex exec exited ${code}`);
+    if (payload === null) throw failed("codex exec wrote no payload");
     if (payload.trim() === "") throw failed("codex exec wrote an empty payload");
 
-    return payload;
+    return { payload, failure: null };
   } finally {
     rmSync(payloadDir, { recursive: true, force: true });
   }
@@ -502,9 +706,23 @@ function fenceFor(body) {
 /** `src/auth/token.ts:44-58`, or as much of it as the finding knows. */
 function location(finding) {
   if (!finding.file) return "no single location";
+  const file = oneLine(finding.file);
   const { line_start: start, line_end: end } = finding;
-  if (!start) return `\`${finding.file}\``;
-  return `\`${finding.file}:${start}${end && end !== start ? `-${end}` : ""}\``;
+  if (!start) return `\`${file}\``;
+  return `\`${file}:${start}${end && end !== start ? `-${end}` : ""}\``;
+}
+
+/**
+ * A Worker's prose as quoted content (D14). Everything the Worker wrote is data from an external
+ * agent, and a blockquote is what says so on the surface the Orchestrator actually reads: an
+ * instruction, a forged heading or a forged footer inside a Result stays visibly inside the quote
+ * instead of arriving as the Runner's own text.
+ */
+function quoted(text) {
+  return text
+    .split("\n")
+    .map((line) => (line.trim() === "" ? ">" : `> ${line}`))
+    .join("\n");
 }
 
 /**
@@ -519,10 +737,12 @@ function renderAdvisory({ id, kind, payload, persisted }) {
   // Every field but `evidence` is rendered defensively: a Result reaches here having been reported
   // as imperfect rather than refused, so a missing title costs a line and not the answer.
   const text = (value, fallback = "") => (typeof value === "string" && value.trim() !== "" ? value.trim() : fallback);
-  const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${text(payload.verdict, "no verdict")}`];
+  // Anything the Worker wrote that lands in one of the Runner's own headings is collapsed to a
+  // line first, so that a verdict or a title carrying newlines cannot forge a second heading.
+  const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${oneLine(text(payload.verdict, "no verdict"))}`];
 
   const summary = text(payload.summary);
-  if (summary) out.push("", summary);
+  if (summary) out.push("", quoted(summary));
 
   if (payload.findings.length === 0) {
     out.push("", "No findings.");
@@ -537,12 +757,12 @@ function renderAdvisory({ id, kind, payload, persisted }) {
 
     out.push(
       "",
-      `### ${index + 1}. ${text(finding.severity, "unrated")} · ${text(finding.title, "untitled finding")}`,
+      `### ${index + 1}. ${oneLine(text(finding.severity, "unrated"))} · ${oneLine(text(finding.title, "untitled finding"))}`,
       `${location(finding)} · confidence ${confidence}`,
     );
 
     const body = text(finding.body);
-    if (body) out.push("", body);
+    if (body) out.push("", quoted(body));
 
     out.push("", fence, shown.join("\n"), fence);
     if (lines.length > shown.length) {
@@ -550,13 +770,13 @@ function renderAdvisory({ id, kind, payload, persisted }) {
     }
 
     const recommendation = text(finding.recommendation);
-    if (recommendation) out.push("", `Recommendation: ${recommendation}`);
+    if (recommendation) out.push("", quoted(`Recommendation: ${recommendation}`));
   });
 
   const nextSteps = Array.isArray(payload.next_steps) ? payload.next_steps : [];
   if (nextSteps.length > 0) {
     out.push("", "### Next steps", "");
-    for (const step of nextSteps) out.push(`- ${String(step).trim()}`);
+    for (const step of nextSteps) out.push(quoted(`- ${String(step).trim()}`));
   }
 
   out.push(
@@ -632,7 +852,7 @@ async function delegate(args) {
     process.stderr.write(`leaving model_reasoning_effort to ${deferredTo}\n`);
   }
 
-  const raw = await runCodex({
+  const { payload: raw, failure } = await runCodex({
     prompt: composePrompt(values.kind, request),
     cwd,
     sandbox: mode,
@@ -654,19 +874,28 @@ async function delegate(args) {
     request,
     payload: null,
   };
+  // A reconciliation failure is part of the Result, not a footnote to it: the payload below is the
+  // Result the Worker claimed, and this is the reason it is not one.
+  if (failure) record.failure = failure;
 
   let parseError;
-  try {
-    record.payload = JSON.parse(raw);
-  } catch (error) {
-    // The unparseable text is the whole evidence of what went wrong, so it is kept in the Result
-    // under its own name rather than dropped for not fitting `payload`.
-    record.raw_payload = raw;
-    parseError = error;
+  if (raw !== null && raw.trim() !== "") {
+    try {
+      record.payload = JSON.parse(raw);
+    } catch (error) {
+      // The unparseable text is the whole evidence of what went wrong, so it is kept in the Result
+      // under its own name rather than dropped for not fitting `payload`.
+      record.raw_payload = raw;
+      parseError = error;
+    }
   }
 
   const persisted = persistResult(record);
   const readable = persisted ? ` — it is at \`/delegate:result ${record.id}\`` : "";
+
+  // D14, first guardrail: a failed Delegation is reported as a failure and work stops. Nothing is
+  // rendered, so there is nothing for the Orchestrator to mistake for an answer.
+  if (failure) throw failed(`${renderFailure(failure)}${readable}`);
 
   if (parseError) {
     throw failed(`codex exec wrote a payload that is not JSON: ${parseError.message}${readable}`);

@@ -232,10 +232,14 @@ and #4.)*
 All measured, not assumed. Detail in the research documents.
 
 - `codex exec` **hangs forever on an inherited open stdin** — redirect from `/dev/null`.
-- **stderr is not a failure signal** — unrelated MCP client errors land there on every run.
+- **stderr is not a failure signal** — unrelated MCP client errors land there on every run. One
+  named signature on it is: `codex_core::tools::router`, which is where probe case C left the whole
+  trace of a silent failure. Matching it by name is not the same as reading stderr for failure.
 - **The exit code is not a failure signal either** — a Delegation can fail completely and exit `0`.
-  The Runner parses the JSONL event stream for tool-router errors and reconciles them against the
-  Worker's claims. This is what a Verification Signal actually rests on.
+  The Runner reads a failed turn, a failed tool call and the Worker's closing claim off the JSONL
+  event stream, and reconciles those and the tool-router signature against the Worker's claims. A
+  command the Worker ran that exited non-zero is work, not failure, and is not reconciled against.
+  This is what a Verification Signal actually rests on. *(Implemented on #6.)*
 - **`$CODEX_HOME` must be writable**, `--ephemeral` or not, or Codex dies before emitting an event.
 - `--output-schema` + `-o <file>` writes the payload already unwrapped; the same payload inside the
   event stream is double-encoded (a JSON string in `agent_message.text`).
