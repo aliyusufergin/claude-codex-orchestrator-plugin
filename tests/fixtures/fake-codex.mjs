@@ -15,6 +15,8 @@
 //                   does this, and it is what hangs forever on an inherited open stdin)
 //   events          array of objects emitted as JSONL on stdout (default: a canned turn)
 //   streamPayload   payload embedded double-encoded in the default stream's agent_message.text
+//   streamTail      text written to stdout after the events, verbatim and with no trailing
+//                   newline — for a stream cut off mid-record
 //   payload         payload written unwrapped to the `-o` file (default: a minimal Advisory
 //                   Result, so that a test which is not about the payload still gets one the
 //                   Runner will render)
@@ -143,6 +145,7 @@ const events = config.events ?? [
 ];
 
 for (const event of events) process.stdout.write(`${JSON.stringify(event)}\n`);
+if (config.streamTail) process.stdout.write(config.streamTail);
 
 const refuseWrites = config.refuseWrites === true;
 

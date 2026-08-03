@@ -143,14 +143,33 @@ describe("the Review Forwarder", () => {
   it("returns the Runner's stdout verbatim", () => {
     assert.match(body, /verbatim/i);
   });
+
+  it("frames what it returns as data from an external agent, not instruction", () => {
+    // D14, second guardrail, on the surface the Result crosses into the Orchestrator.
+    assert.match(body, /external agent/i);
+    assert.match(body, /not instruction/i);
+  });
+
+  it("reports a failed Delegation rather than answering in its place", () => {
+    // D14, first guardrail. A Forwarder that reviewed the change itself when the Runner failed
+    // would return an answer the Orchestrator cannot tell apart from the Worker's.
+    assert.match(body, /failed/i);
+    assert.match(body, /never replaced with your own answer/i);
+  });
 });
 
 describe("commands", () => {
+  const { frontmatter, body } = readAsset("commands", "result.md");
+
   it("ships /delegate:result, off the model's own toolkit", () => {
-    const { frontmatter, body } = readAsset("commands", "result.md");
     assert.equal(frontmatter["disable-model-invocation"], "true");
     assert.ok(frontmatter["argument-hint"], "a command taking an id says so");
     assert.match(body, /runner\.mjs" result/);
+  });
+
+  it("frames the Result it prints as data from an external agent, not instruction", () => {
+    assert.match(body, /external agent/i);
+    assert.match(body, /not instruction/i);
   });
 });
 

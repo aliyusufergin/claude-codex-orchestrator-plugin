@@ -225,6 +225,17 @@ afterwards. The payload directory the Runner hands Codex moved from `tmpdir()` t
 #4, which lands C5's preferred path; the Workspace itself is still #9's to place. *(Raised on #9
 and #4.)*
 
+**C7 — Which tool-router errors fail a Delegation is decided by the Delegation Class.** #6's
+criterion is blunt: any tool-router error fails the run, whatever the exit code. Measured against
+real Codex, that is wrong for Advisory. An Advisory Delegation runs `read-only` by design, so every
+write the Worker attempts is denied by policy and emits the router signature — while the Result,
+prose from reading, is untouched by a write that never happened. So a router error naming a policy
+denial of a write is reported and not failed **for Advisory only**; every other router error still
+fails it, which is what keeps probe case E — the read-only sandbox stopping the Worker reading at
+all — a failure. For Verifiable the same denial *is* the failure, and probe case C's text differs
+from it. *(Measured and landed on #6; a Review Delegation reached the same conclusion
+independently.)*
+
 ---
 
 ## Transport facts the implementation must respect
@@ -232,10 +243,20 @@ and #4.)*
 All measured, not assumed. Detail in the research documents.
 
 - `codex exec` **hangs forever on an inherited open stdin** — redirect from `/dev/null`.
-- **stderr is not a failure signal** — unrelated MCP client errors land there on every run.
+- **stderr is not a failure signal** — unrelated MCP client errors land there on every run. One
+  named signature on it is: `codex_core::tools::router`, and it is the *only* trace a rejected tool
+  call leaves anywhere. Matching it by name is not the same as reading stderr for failure.
+- **A rejected tool call produces no event** — measured on 0.146.0: a write denied by `-s read-only`
+  left no `error` item, no `turn.failed`, no item reporting `status: "failed"`, and exit code `0`
+  ([event-stream shape](../research/exec-event-stream-shape.md)).
 - **The exit code is not a failure signal either** — a Delegation can fail completely and exit `0`.
-  The Runner parses the JSONL event stream for tool-router errors and reconciles them against the
-  Worker's claims. This is what a Verification Signal actually rests on.
+  The Runner matches the tool-router signature on stderr, reads a failed turn, an error and the
+  Worker's closing claim off the JSONL event stream, and reconciles the two. A command the Worker
+  ran that exited non-zero is work, not failure, and is not reconciled against. This is what a
+  Verification Signal actually rests on. *(Implemented on #6.)*
+- **Items are flat on the wire** — detail fields sit directly on `item`, not under `details`.
+- **The closing `agent_message.text` is the payload** under `--output-schema`, double-encoded — and
+  there may be more than one `agent_message` in a turn, the last being the Result.
 - **`$CODEX_HOME` must be writable**, `--ephemeral` or not, or Codex dies before emitting an event.
 - `--output-schema` + `-o <file>` writes the payload already unwrapped; the same payload inside the
   event stream is double-encoded (a JSON string in `agent_message.text`).
