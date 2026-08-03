@@ -40,8 +40,14 @@ export async function createFixtureRepo(t) {
   const root = mkdtempSync(path.join(tmpdir(), "delegate-test-"));
   const repo = path.join(root, "repo");
   const fakeDir = path.join(root, "fake");
+  // A fixture $CODEX_HOME and a stand-in for `/tmp`, so that the Runner's two writability
+  // preconditions are measured against directories a test owns rather than the machine's.
+  const codexHome = path.join(root, "codex-home");
+  const tmpProbe = path.join(root, "tmp-probe");
   mkdirSync(repo);
   mkdirSync(fakeDir);
+  mkdirSync(codexHome);
+  mkdirSync(tmpProbe);
 
   writeFileSync(path.join(repo, "README.md"), "# fixture\n");
   await git(repo, ["init", "-b", "main"]);
@@ -56,6 +62,8 @@ export async function createFixtureRepo(t) {
     root,
     repo,
     fakeDir,
+    codexHome,
+    tmpProbe,
     configureFake(config) {
       writeFileSync(path.join(fakeDir, "fake-codex.json"), `${JSON.stringify(config, null, 2)}\n`);
     },
@@ -81,6 +89,15 @@ export function runRunner(fixture, args, options = {}) {
       ...process.env,
       DELEGATE_CODEX_BIN: FAKE_CODEX,
       DELEGATE_FAKE_CODEX_DIR: fixture.fakeDir,
+      CODEX_HOME: fixture.codexHome,
+      // Sandbox detection is a measurement of the machine the tests run on, so it is forced off
+      // by default and turned on explicitly by the tests that are about it.
+      DELEGATE_SANDBOXED: "0",
+      DELEGATE_TMP_DIR: fixture.tmpProbe,
+      // The Worker's environment is an allowlist, and the fake Codex binary finds its state
+      // directory through one variable of its own. Extending the allowlist is how a user gets a
+      // variable through, so the fake goes through the same door.
+      DELEGATE_ENV_ALLOWLIST: "DELEGATE_FAKE_CODEX_DIR",
       ...env,
     },
     stdio: ["pipe", "pipe", "pipe"],

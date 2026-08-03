@@ -51,6 +51,9 @@ A Delegation whose Result is a diff accompanied by a mechanical pass/fail signal
 `workspace-write` inside a Workspace. Covers the Implementation, Repro, and Migration Task Kinds.
 _Avoid_: write task, mutating task
 
+Both modes are what the Class asks for, and what it gets whenever Codex's own sandbox can run.
+ADR-0004 governs the one case where it cannot.
+
 **Delegation Budget**:
 The shared allowance every Delegation draws from, counted against the same rolling window the
 Worker's own provider enforces. Finite and unreplenishable within the window, so spending it on
