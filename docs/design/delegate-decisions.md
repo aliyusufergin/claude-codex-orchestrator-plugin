@@ -55,6 +55,13 @@ first. Accepted cost — six prompt templates written before real usage informs 
 high, Review medium, Repro and Migration low), overridable by the user's `config.toml`. The model
 is never passed — published model names are inconsistent across sources and churn fast.
 
+*Implemented on #5, with two details the decision did not settle.* `-c` **beats** `config.toml` in
+Codex's own precedence, so "overridable by the user's `config.toml`" can only mean the Runner does
+not pass the flag at all when their config sets the key — it scans `$CODEX_HOME/config.toml` and
+`<cwd>/.codex/config.toml` for a top-level `model_reasoning_effort` and defers to either. And D16
+names five Task Kinds: Implementation sits at `high`, alongside the other kinds asked for judgement
+rather than mechanism, until #9 calibrates it.
+
 **D20 — Two output schemas, one per Delegation Class.**
 
 *Advisory*: `verdict`, `summary`, `findings[]`, `next_steps[]`. Each finding carries `severity`,
@@ -64,6 +71,18 @@ is never passed — published model names are inconsistent across sources and ch
 *Verifiable*: `summary`, `branch`, `files_changed[]`, `diff_stat`, `verification`
 (`command`, `exit_code`, `passed`), `caveats[]`. Task Kind differences ride as optional fields —
 `expected_failure` for **Repro**.
+
+*Advisory implemented on #5* (`schemas/advisory.json`). Vocabularies the decision left open:
+`verdict` is `pass` / `concerns` / `blocking`, `severity` is `critical` / `high` / `medium` / `low`,
+`confidence` is a number from 0 to 1. `file`, `line_start` and `line_end` are required but nullable,
+so a finding about the change as a whole is representable without a Worker being able to omit the
+fields; `evidence` is never nullable. The Runner re-checks the payload against these rules on the
+way back rather than trusting the schema to have held — a schema is a request, not a guarantee —
+and splits what it finds by what it costs. A finding without `evidence`, or a payload with no
+`findings` array, is fatal: there is nothing ADR-0003 can act on. Everything else is reported on
+stderr and rendered anyway, because the Budget is spent by the time the check runs and withholding
+nine sound findings over a confidence expressed as a string spends it for nothing. Either way what
+came back is persisted first, unparseable text included, under `raw_payload`.
 
 ---
 
@@ -131,6 +150,14 @@ command", which contradicted D13.)* → ADR-0003
 **D13 — The Orchestrator verifies, triages, then applies.** Findings are checked against the code
 via `evidence`; confirmed, localised, test-covered ones are applied; anything unverifiable,
 broad, or touching behaviour, public API, security or architecture goes to the user. → ADR-0003
+
+**D24 — Where a Result is persisted** *(new on #5; not from the session)*. `$DELEGATE_STATE_DIR`, else
+`${CLAUDE_PLUGIN_DATA}`, else `$CODEX_HOME/delegate` — `results/<kind>-<8 hex>.json`, one file per
+Delegation. `${CLAUDE_PLUGIN_ROOT}` is explicitly not durable across plugin updates; `$CODEX_HOME`
+is the fallback because it is the one directory a Delegation has already established is writable,
+including under an outer sandbox where `$HOME` is not. Persisting is best-effort: it happens before
+the Result is validated or rendered, and a directory that cannot be written to costs
+`/delegate:result`, never the answer — the Budget for it is already spent.
 
 **D21 — A Stale Workspace cannot be Landed autonomously.** The Runner records the `HEAD` and a hash
 of the uncommitted state it seeded from and compares at Landing time. → ADR-0003

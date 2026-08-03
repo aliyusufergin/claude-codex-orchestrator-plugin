@@ -5,12 +5,12 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { createFixtureRepo, flagValue, runRunner } from "./helpers/harness.mjs";
+import { advisoryPayload, createFixtureRepo, flagValue, runRunner } from "./helpers/harness.mjs";
 
 describe("runner delegate", () => {
-  it("prints the Worker's payload to stdout and exits 0", async (t) => {
+  it("returns the Worker's Result on stdout and exits 0", async (t) => {
     const fixture = await createFixtureRepo(t);
-    fixture.configureFake({ payload: { summary: "looks fine" } });
+    fixture.configureFake({ payload: advisoryPayload({ summary: "looks fine" }) });
 
     const run = await runRunner(fixture, [
       "delegate",
@@ -21,20 +21,21 @@ describe("runner delegate", () => {
     ]);
 
     assert.equal(run.code, 0, run.stderr);
-    assert.deepEqual(JSON.parse(run.stdout), { summary: "looks fine" });
+    assert.match(run.stdout, /looks fine/);
   });
 
   it("reads the payload from the -o file, not the double-encoded copy in the event stream", async (t) => {
     const fixture = await createFixtureRepo(t);
     fixture.configureFake({
-      payload: { summary: "from the output file" },
-      streamPayload: { summary: "from the event stream" },
+      payload: advisoryPayload({ summary: "from the output file" }),
+      streamPayload: advisoryPayload({ summary: "from the event stream" }),
     });
 
     const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
 
     assert.equal(run.code, 0, run.stderr);
-    assert.deepEqual(JSON.parse(run.stdout), { summary: "from the output file" });
+    assert.match(run.stdout, /from the output file/);
+    assert.doesNotMatch(run.stdout, /from the event stream/);
   });
 
   it("invokes `codex exec --json` with an output schema, an output file and the prompt", async (t) => {
@@ -52,7 +53,9 @@ describe("runner delegate", () => {
 
     const invocation = fixture.invocation();
     assert.equal(invocation.subcommand, "exec");
-    assert.equal(invocation.prompt, "review my diff");
+    // The prompt is the Task Kind's template with the request in it — the template's own coverage
+    // is in `advisory-review.test.mjs`.
+    assert.ok(invocation.prompt.includes("review my diff"), invocation.prompt);
     assert.ok(invocation.args.includes("--json"), invocation.args.join(" "));
 
     const schema = flagValue(invocation.args, "--output-schema");
@@ -99,7 +102,7 @@ describe("runner delegate", () => {
     });
 
     assert.equal(run.code, 0, run.stderr);
-    assert.equal(fixture.invocation().prompt, "a prompt from stdin");
+    assert.ok(fixture.invocation().prompt.includes("a prompt from stdin"), fixture.invocation().prompt);
   });
 
   it("passes the working directory as -C and never changes its own", async (t) => {
@@ -137,13 +140,13 @@ describe("runner delegate", () => {
     const fixture = await createFixtureRepo(t);
     fixture.configureFake({
       stderr: "ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed\n",
-      payload: { summary: "fine despite the noise" },
+      payload: advisoryPayload({ summary: "fine despite the noise" }),
     });
 
     const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
 
     assert.equal(run.code, 0, run.stderr);
-    assert.deepEqual(JSON.parse(run.stdout), { summary: "fine despite the noise" });
+    assert.match(run.stdout, /fine despite the noise/);
   });
 
   it("fails when Codex exits non-zero", async (t) => {
@@ -193,13 +196,13 @@ describe("runner delegate", () => {
       "--prompt=--help me read this diff",
     ]);
     assert.equal(attached.code, 0, attached.stderr);
-    assert.equal(fixture.invocation().prompt, "--help me read this diff");
+    assert.ok(fixture.invocation().prompt.includes("--help me read this diff"), fixture.invocation().prompt);
 
     const piped = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "-"], {
       stdin: "-C /etc is not a flag here\n",
     });
     assert.equal(piped.code, 0, piped.stderr);
-    assert.equal(fixture.invocation().prompt, "-C /etc is not a flag here");
+    assert.ok(fixture.invocation().prompt.includes("-C /etc is not a flag here"), fixture.invocation().prompt);
   });
 
   // Where the payload directory lives and that it is removed on failure is covered in

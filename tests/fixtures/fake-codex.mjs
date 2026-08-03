@@ -15,7 +15,11 @@
 //                   does this, and it is what hangs forever on an inherited open stdin)
 //   events          array of objects emitted as JSONL on stdout (default: a canned turn)
 //   streamPayload   payload embedded double-encoded in the default stream's agent_message.text
-//   payload         payload written unwrapped to the `-o` file (default {"summary":"ok"})
+//   payload         payload written unwrapped to the `-o` file (default: a minimal Advisory
+//                   Result, so that a test which is not about the payload still gets one the
+//                   Runner will render)
+//   rawPayload      text written to the `-o` file verbatim, in place of `payload` — for the shapes
+//                   a JSON-encoded payload cannot express, such as a turn cut off mid-write
 //   writePayload    set false to exit successfully having written no payload (probe case C)
 //   writeFiles      { relativePath: contents } written under the `-C` directory
 //   refuseWrites    set true to write nothing at all — no payload, no files — while still
@@ -116,7 +120,14 @@ writeFileSync(
   )}\n`,
 );
 
-const payload = config.payload ?? { summary: "ok" };
+const DEFAULT_PAYLOAD = {
+  verdict: "pass",
+  summary: "ok",
+  findings: [],
+  next_steps: [],
+};
+
+const payload = config.payload ?? DEFAULT_PAYLOAD;
 const streamPayload = config.streamPayload ?? payload;
 const events = config.events ?? [
   { type: "thread.started", thread_id: "00000000-0000-4000-8000-000000000000" },
@@ -146,7 +157,7 @@ if (!refuseWrites) {
 
 const outputFile = flags["-o"] ?? flags["--output-last-message"];
 if (outputFile && !refuseWrites && config.writePayload !== false) {
-  writeFileSync(outputFile, `${JSON.stringify(payload)}\n`);
+  writeFileSync(outputFile, config.rawPayload ?? `${JSON.stringify(payload)}\n`);
 }
 
 if (config.stderr) process.stderr.write(config.stderr);
