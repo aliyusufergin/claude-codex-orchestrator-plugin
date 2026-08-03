@@ -140,7 +140,43 @@ describe("review delegation", () => {
 
     assert.equal(run.code, 1);
     assert.equal(run.stdout, "");
-    assert.match(run.stderr, /verdict/);
+    assert.match(run.stderr, /findings/);
+  });
+
+  it("returns findings whose evidence is sound over a field that is not, and says which", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({
+      payload: advisoryPayload({
+        // The Budget is spent by the time this arrives. Withholding a sound finding over a
+        // confidence expressed as a string spends it for nothing.
+        findings: [advisoryFinding({ confidence: "0.8", severity: "showstopper" })],
+      }),
+    });
+
+    const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
+
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stdout, /Token expiry is compared with the wrong operator/);
+    assert.match(run.stdout, /if \(expiresAt < Date\.now\(\)\) \{/);
+    assert.match(run.stderr, /confidence/);
+    assert.match(run.stderr, /severity/);
+  });
+
+  it("keeps a payload that is not JSON at all, and fails naming it", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    // A turn cut off mid-write: the file exists, and half a Result is in it.
+    fixture.configureFake({ rawPayload: '{"verdict": "pass", "summ' });
+
+    const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
+
+    assert.equal(run.code, 1);
+    assert.equal(run.stdout, "");
+    assert.match(run.stderr, /not JSON/);
+
+    const [record] = fixture.persistedResults();
+    assert.ok(record, "an unparseable payload was not persisted");
+    assert.equal(record.payload, null);
+    assert.match(record.raw_payload, /\{"verdict"/);
   });
 
   it("renders a Result with no findings without inventing any", async (t) => {
@@ -224,6 +260,7 @@ describe("reasoning effort", () => {
       review: "medium",
       diagnosis: "high",
       adversarial: "high",
+      implementation: "high",
       repro: "low",
       migration: "low",
     };
@@ -332,8 +369,9 @@ describe("delegate result", () => {
 });
 
 /**
- * A JSON Schema check narrow enough to be worth having in a test: the Advisory schema uses type,
- * enum, required and additionalProperties, and nothing else that changes whether a Result conforms.
+ * A JSON Schema check narrow enough to be worth having in a test: it covers every keyword the
+ * Advisory schema actually uses — type, enum, required, additionalProperties, minLength, minimum
+ * and maximum — and nothing else. A schema that grows a keyword past this list needs it added.
  */
 function validateAgainstAdvisorySchema(payload) {
   const schema = JSON.parse(readFileSync(path.join(REPO_ROOT, "schemas", "advisory.json"), "utf8"));
@@ -353,8 +391,9 @@ function validateAgainstAdvisorySchema(payload) {
     if (actual === "string" && node.minLength && value.length < node.minLength) {
       problems.push(`${at} is shorter than ${node.minLength}`);
     }
-    if (actual === "integer" && node.minimum !== undefined && value < node.minimum) {
-      problems.push(`${at} is below ${node.minimum}`);
+    if (typeof value === "number") {
+      if (node.minimum !== undefined && value < node.minimum) problems.push(`${at} is below ${node.minimum}`);
+      if (node.maximum !== undefined && value > node.maximum) problems.push(`${at} is above ${node.maximum}`);
     }
     if (actual === "array") {
       value.forEach((entry, index) => problems.push(...check(entry, node.items, `${at}[${index}]`)));

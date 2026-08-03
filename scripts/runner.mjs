@@ -267,11 +267,15 @@ function workerEnv() {
  * prompt would drift from the schema the Runner enforces, and only one of the two would notice.
  *
  * A Task Kind whose template is still to be written sends the request on its own rather than
- * nothing at all.
+ * nothing at all — and says so, because a Delegation running without the instructions its Class
+ * assumes is a difference the user is entitled to see.
  */
 function composePrompt(kind, request) {
   const template = path.join(PROMPT_DIR, `${kind}.md`);
-  if (!existsSync(template)) return request;
+  if (!existsSync(template)) {
+    process.stderr.write(`no prompt template for --kind ${kind} yet: sending the request alone\n`);
+    return request;
+  }
   // The replacement is a function so that `$&` and friends in the request stay literal text.
   return readFileSync(template, "utf8").replace(REQUEST_PLACEHOLDER, () => request).trim();
 }
@@ -304,21 +308,28 @@ function declaresReasoningEffort(file) {
  * already answered the question themselves.
  *
  * `-c` wins over `config.toml` in Codex's own precedence, so "the user's config overrides the
- * table" can only mean not passing the flag at all when their config sets the key. Both files Codex
- * would read are checked; a project-level one only applies to a trusted project, but a Runner that
- * passed the flag anyway would override a setting the user can see and expects to hold.
+ * table" can only mean not passing the flag at all when their config sets the key.
+ *
+ * Both files Codex reads by default are checked. A project-level one is loaded only for a trusted
+ * project, so deferring to it can leave the level at Codex's own default rather than the user's —
+ * the alternative is overriding a setting the user can see in their repository and expects to hold,
+ * which is the worse of the two. Profile files (`$CODEX_HOME/<name>.config.toml`) are not read,
+ * because a profile is layered only by `-p` and the Runner never passes one.
  */
 function reasoningEffort(kind, cwd) {
-  const level = REASONING_EFFORT[kind];
-  if (!level) return { args: [] };
+  const level = REASONING_EFFORT[kind] ?? null;
+  const deferredTo =
+    level === null
+      ? null
+      : [path.join(codexHome(), "config.toml"), path.join(cwd, ".codex", "config.toml")].find(
+          declaresReasoningEffort,
+        ) ?? null;
 
-  const configured = [
-    path.join(codexHome(), "config.toml"),
-    path.join(cwd, ".codex", "config.toml"),
-  ].find(declaresReasoningEffort);
-  if (configured) return { args: [], deferredTo: configured };
-
-  return { args: ["-c", `model_reasoning_effort=${level}`], level };
+  return {
+    args: level === null || deferredTo ? [] : ["-c", `model_reasoning_effort=${level}`],
+    level: deferredTo ? null : level,
+    deferredTo,
+  };
 }
 
 function spawnCodex(args) {
@@ -417,54 +428,69 @@ function persistResult(record) {
   }
 }
 
+/** The vocabularies the Advisory schema defines, read from it rather than restated here. */
+function advisoryVocabulary() {
+  const schema = JSON.parse(readFileSync(SCHEMA_BY_CLASS.advisory, "utf8"));
+  return {
+    verdicts: schema.properties.verdict.enum,
+    severities: schema.properties.findings.items.properties.severity.enum,
+  };
+}
+
 /**
- * What an Advisory payload has to carry before the Runner will render it as a Result. The schema
- * already asked Codex for all of this; this checks that it arrived, because a finding without
- * `evidence` cannot be verified against the code and ADR-0003 then withholds every use of it.
+ * What is wrong with an Advisory payload, split by what it costs.
  *
- * Returns the problems, most structural first, so one malformed Result explains itself in one run.
+ * The schema already asked Codex for all of this; this checks what arrived, because a schema is a
+ * request and not a guarantee. `fatal` is the part the Orchestrator cannot work around — above all
+ * a finding without `evidence`, which ADR-0003 has no way to act on. Everything else is `noted`:
+ * a Delegation's Budget is spent by the time this runs, and withholding nine good findings over a
+ * confidence expressed as a string spends it for nothing.
  */
 function advisoryProblems(payload) {
-  const problems = [];
+  const fatal = [];
+  const noted = [];
   const filled = (value) => typeof value === "string" && value.trim() !== "";
-  const lineNumber = (value) => value === null || (Number.isInteger(value) && value >= 1);
+  const lineNumber = (value) => value == null || (Number.isInteger(value) && value >= 1);
+  const { verdicts, severities } = advisoryVocabulary();
 
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    return ["the payload is not an object"];
+    return { fatal: ["the payload is not an object"], noted };
   }
-  if (!["pass", "concerns", "blocking"].includes(payload.verdict)) {
-    problems.push(`verdict is not pass, concerns or blocking: ${JSON.stringify(payload.verdict)}`);
-  }
-  if (!filled(payload.summary)) problems.push("summary is missing or empty");
-  if (!Array.isArray(payload.next_steps)) problems.push("next_steps is not an array");
-
   if (!Array.isArray(payload.findings)) {
-    problems.push("findings is not an array");
-    return problems;
+    return { fatal: ["findings is not an array"], noted };
   }
+
+  if (!verdicts.includes(payload.verdict)) {
+    noted.push(`verdict is not one of ${verdicts.join(", ")}: ${JSON.stringify(payload.verdict)}`);
+  }
+  if (!filled(payload.summary)) noted.push("summary is missing or empty");
+  if (!Array.isArray(payload.next_steps)) noted.push("next_steps is not an array");
 
   payload.findings.forEach((finding, index) => {
     const at = `findings[${index}]`;
     if (finding === null || typeof finding !== "object" || Array.isArray(finding)) {
-      problems.push(`${at} is not an object`);
+      fatal.push(`${at} is not an object`);
       return;
     }
-    if (!filled(finding.evidence)) problems.push(`${at}.evidence is missing or empty`);
-    if (!["critical", "high", "medium", "low"].includes(finding.severity)) {
-      problems.push(`${at}.severity is not critical, high, medium or low`);
+    // The one field a finding is worthless without: the Orchestrator acts on a finding by checking
+    // this snippet against the file it names, and there is nothing to check without it.
+    if (!filled(finding.evidence)) fatal.push(`${at}.evidence is missing or empty`);
+
+    if (!severities.includes(finding.severity)) {
+      noted.push(`${at}.severity is not one of ${severities.join(", ")}`);
     }
     for (const field of ["title", "body", "recommendation"]) {
-      if (!filled(finding[field])) problems.push(`${at}.${field} is missing or empty`);
+      if (!filled(finding[field])) noted.push(`${at}.${field} is missing or empty`);
     }
-    if (!(finding.file === null || filled(finding.file))) problems.push(`${at}.file is not a path or null`);
-    if (!lineNumber(finding.line_start)) problems.push(`${at}.line_start is not a line number or null`);
-    if (!lineNumber(finding.line_end)) problems.push(`${at}.line_end is not a line number or null`);
+    if (!(finding.file == null || filled(finding.file))) noted.push(`${at}.file is not a path or null`);
+    if (!lineNumber(finding.line_start)) noted.push(`${at}.line_start is not a line number or null`);
+    if (!lineNumber(finding.line_end)) noted.push(`${at}.line_end is not a line number or null`);
     if (typeof finding.confidence !== "number" || finding.confidence < 0 || finding.confidence > 1) {
-      problems.push(`${at}.confidence is not a number between 0 and 1`);
+      noted.push(`${at}.confidence is not a number between 0 and 1`);
     }
   });
 
-  return problems;
+  return { fatal, noted };
 }
 
 /** A fence long enough to hold `body` whatever backticks are in it. */
@@ -490,7 +516,13 @@ function location(finding) {
  * field the Orchestrator has to compare against the file byte for byte.
  */
 function renderAdvisory({ id, kind, payload, persisted }) {
-  const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${payload.verdict}`, "", payload.summary.trim()];
+  // Every field but `evidence` is rendered defensively: a Result reaches here having been reported
+  // as imperfect rather than refused, so a missing title costs a line and not the answer.
+  const text = (value, fallback = "") => (typeof value === "string" && value.trim() !== "" ? value.trim() : fallback);
+  const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${text(payload.verdict, "no verdict")}`];
+
+  const summary = text(payload.summary);
+  if (summary) out.push("", summary);
 
   if (payload.findings.length === 0) {
     out.push("", "No findings.");
@@ -499,29 +531,32 @@ function renderAdvisory({ id, kind, payload, persisted }) {
   payload.findings.forEach((finding, index) => {
     const evidence = finding.evidence.replace(/\s+$/, "");
     const lines = evidence.split("\n");
-    const shown = lines.slice(0, EVIDENCE_MAX_LINES).join("\n");
+    const shown = lines.slice(0, EVIDENCE_MAX_LINES);
     const fence = fenceFor(evidence);
+    const confidence = typeof finding.confidence === "number" ? finding.confidence : "unstated";
 
     out.push(
       "",
-      `### ${index + 1}. ${finding.severity} · ${finding.title.trim()}`,
-      `${location(finding)} · confidence ${finding.confidence}`,
-      "",
-      finding.body.trim(),
-      "",
-      fence,
-      shown,
-      fence,
+      `### ${index + 1}. ${text(finding.severity, "unrated")} · ${text(finding.title, "untitled finding")}`,
+      `${location(finding)} · confidence ${confidence}`,
     );
-    if (lines.length > shown.split("\n").length) {
-      out.push(`_${lines.length - EVIDENCE_MAX_LINES} further lines of evidence — \`/delegate:result ${id}\`._`);
+
+    const body = text(finding.body);
+    if (body) out.push("", body);
+
+    out.push("", fence, shown.join("\n"), fence);
+    if (lines.length > shown.length) {
+      out.push(`_${lines.length - shown.length} further lines of evidence — \`/delegate:result ${id}\`._`);
     }
-    out.push("", `Recommendation: ${finding.recommendation.trim()}`);
+
+    const recommendation = text(finding.recommendation);
+    if (recommendation) out.push("", `Recommendation: ${recommendation}`);
   });
 
-  if (payload.next_steps.length > 0) {
+  const nextSteps = Array.isArray(payload.next_steps) ? payload.next_steps : [];
+  if (nextSteps.length > 0) {
     out.push("", "### Next steps", "");
-    for (const step of payload.next_steps) out.push(`- ${String(step).trim()}`);
+    for (const step of nextSteps) out.push(`- ${String(step).trim()}`);
   }
 
   out.push(
@@ -605,9 +640,9 @@ async function delegate(args) {
     extraArgs: effortArgs,
   });
 
-  // An Advisory Delegation blocks, so what it returns is the Result itself and not a job id. The
-  // whole payload is persisted before anything is checked or rendered: the Budget for it is already
-  // spent, and a Result the Runner refuses to render is exactly the one worth being able to read.
+  // An Advisory Delegation blocks, so what it returns is the Result itself and not a job id. What
+  // came back is persisted before it is parsed, checked or rendered: the Budget for it is already
+  // spent, and the Result the Runner will not render is exactly the one worth being able to read.
   const record = {
     id: `${values.kind}-${randomBytes(4).toString("hex")}`,
     kind: values.kind,
@@ -617,32 +652,44 @@ async function delegate(args) {
     sandbox: mode,
     reasoning_effort: level ?? null,
     request,
-    payload: parsePayload(raw),
+    payload: null,
   };
+
+  let parseError;
+  try {
+    record.payload = JSON.parse(raw);
+  } catch (error) {
+    // The unparseable text is the whole evidence of what went wrong, so it is kept in the Result
+    // under its own name rather than dropped for not fitting `payload`.
+    record.raw_payload = raw;
+    parseError = error;
+  }
+
   const persisted = persistResult(record);
+  const readable = persisted ? ` — it is at \`/delegate:result ${record.id}\`` : "";
+
+  if (parseError) {
+    throw failed(`codex exec wrote a payload that is not JSON: ${parseError.message}${readable}`);
+  }
 
   if (delegationClass !== "advisory") {
     // The Verifiable rendering arrives with the Workspace on #9. Until then its payload goes out
-    // as it came back.
-    process.stdout.write(`${JSON.stringify(record.payload)}\n`);
+    // as it came back, byte for byte.
+    process.stdout.write(raw.endsWith("\n") ? raw : `${raw}\n`);
     return;
   }
 
-  const problems = advisoryProblems(record.payload);
-  if (problems.length > 0) {
-    const where = persisted ? ` — the payload is at \`/delegate:result ${record.id}\`` : "";
-    throw failed(`the Worker's Result is not a usable Advisory Result: ${problems.join("; ")}${where}`);
+  const { fatal, noted } = advisoryProblems(record.payload);
+  if (fatal.length > 0) {
+    throw failed(`the Worker's Result is not a usable Advisory Result: ${fatal.join("; ")}${readable}`);
+  }
+  // Reported rather than refused: the rendering below survives every one of these, and the
+  // Orchestrator is told what the Worker got wrong on the way past.
+  if (noted.length > 0) {
+    process.stderr.write(`the Worker's Result departs from the Advisory schema: ${noted.join("; ")}\n`);
   }
 
   process.stdout.write(renderAdvisory({ ...record, persisted }));
-}
-
-function parsePayload(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    throw failed(`codex exec wrote a payload that is not JSON: ${error.message}`);
-  }
 }
 
 /**

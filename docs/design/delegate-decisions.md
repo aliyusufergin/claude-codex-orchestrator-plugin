@@ -77,8 +77,12 @@ rather than mechanism, until #9 calibrates it.
 `confidence` is a number from 0 to 1. `file`, `line_start` and `line_end` are required but nullable,
 so a finding about the change as a whole is representable without a Worker being able to omit the
 fields; `evidence` is never nullable. The Runner re-checks the payload against these rules on the
-way back rather than trusting the schema to have held, and a Result that fails the check is
-persisted and named on stderr rather than discarded.
+way back rather than trusting the schema to have held — a schema is a request, not a guarantee —
+and splits what it finds by what it costs. A finding without `evidence`, or a payload with no
+`findings` array, is fatal: there is nothing ADR-0003 can act on. Everything else is reported on
+stderr and rendered anyway, because the Budget is spent by the time the check runs and withholding
+nine sound findings over a confidence expressed as a string spends it for nothing. Either way what
+came back is persisted first, unparseable text included, under `raw_payload`.
 
 ---
 
