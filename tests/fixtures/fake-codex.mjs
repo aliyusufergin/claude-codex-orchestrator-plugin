@@ -26,6 +26,10 @@
 //   writeFiles      { relativePath: contents } written under the `-C` directory
 //   refuseWrites    set true to write nothing at all — no payload, no files — while still
 //                   emitting a stream and exiting with `exitCode`
+//   threadId        the id emitted in `thread.started` (default: a fixed UUID)
+//   refuseResume    set true to reproduce a refused `codex exec resume`: nothing on stdout at all,
+//                   the measured `thread/resume` error on stderr, exit 1. Ignored by a fresh run,
+//                   so one configuration covers both halves of the fallback
 //   stderr          text written to stderr
 //   exitCode        process exit code (default 0)
 //
@@ -69,11 +73,17 @@ function readConfig() {
 function parseArgv(argv) {
   const flags = {};
   const positionals = [];
+  // The subcommand chain and the operands are both positionals to clap, and only their position
+  // relative to `--` tells them apart. `codex exec resume -- <thread> <prompt>` needs both halves
+  // read separately, so they are kept apart here rather than reconstructed by guessing.
+  const command = [];
+  const operands = [];
   let onlyPositionals = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (onlyPositionals) {
       positionals.push(arg);
+      operands.push(arg);
     } else if (arg === "--") {
       // Everything after `--` is a positional, as clap does it.
       onlyPositionals = true;
@@ -88,9 +98,10 @@ function parseArgv(argv) {
       flags[arg] = true;
     } else {
       positionals.push(arg);
+      command.push(arg);
     }
   }
-  return { flags, positionals };
+  return { flags, positionals, command, operands };
 }
 
 async function readStdinBytes() {
@@ -101,17 +112,22 @@ async function readStdinBytes() {
 
 const config = readConfig();
 const argv = process.argv.slice(2);
-const { flags, positionals } = parseArgv(argv);
+const { flags, positionals, command, operands } = parseArgv(argv);
 
 const stdinBytes = config.readStdin === false ? null : await readStdinBytes();
+
+// `codex exec resume [SESSION_ID] [PROMPT]` takes the thread as its first operand and the prompt as
+// its second; `codex exec [PROMPT]` takes only the prompt.
+const resuming = command[1] === "resume";
 
 const invocation = {
   argv: process.argv,
   args: argv,
   flags,
   positionals,
-  subcommand: positionals[0] ?? null,
-  prompt: positionals.slice(1).join(" ") || null,
+  subcommand: command.join(" ") || null,
+  thread: resuming ? operands[0] ?? null : null,
+  prompt: (resuming ? operands.slice(1) : operands).join(" ") || null,
   cwd: process.cwd(),
   env: process.env,
   stdinBytes,
@@ -126,6 +142,17 @@ appendFileSync(
   `${JSON.stringify(invocation)}\n`,
 );
 
+// A resume Codex will not honour, exactly as 0.146.0 does it: not one byte on stdout — no
+// `thread.started`, no events at all — the error on stderr, and exit 1. The fresh Delegation the
+// Runner falls back to is a different invocation and is unaffected by this.
+if (resuming && config.refuseResume === true) {
+  const thread = invocation.thread ?? "";
+  process.stderr.write(
+    `Error: thread/resume: thread/resume failed: no rollout found for thread id ${thread} (code -32600)\n`,
+  );
+  process.exit(1);
+}
+
 const DEFAULT_PAYLOAD = {
   verdict: "pass",
   summary: "ok",
@@ -135,8 +162,10 @@ const DEFAULT_PAYLOAD = {
 
 const payload = config.payload ?? DEFAULT_PAYLOAD;
 const streamPayload = config.streamPayload ?? payload;
+// A resumed run reports the thread it was handed; a fresh one reports the thread it opened.
+const threadId = invocation.thread ?? config.threadId ?? "00000000-0000-4000-8000-000000000000";
 const events = config.events ?? [
-  { type: "thread.started", thread_id: "00000000-0000-4000-8000-000000000000" },
+  { type: "thread.started", thread_id: threadId },
   { type: "turn.started" },
   {
     type: "item.completed",

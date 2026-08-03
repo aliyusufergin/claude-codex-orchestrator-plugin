@@ -39,6 +39,10 @@ Report no finding you cannot place. If something is wrong with the change as a w
 An empty `findings` array is a legitimate Result. Inventing findings to look thorough is worse than
 returning none, because every invented one costs the reader the time to disprove it.
 
+The `verdict` is about the change: `pass` when there is nothing worth changing, `concerns` when
+there are findings worth acting on but none that should stop the change, and `blocking` when at
+least one of them should.
+
 ## What not to do
 
 Do not fix anything, and do not propose a patch as a diff — `recommendation` is prose. Do not

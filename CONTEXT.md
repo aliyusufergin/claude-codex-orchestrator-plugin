@@ -101,6 +101,20 @@ current `HEAD` and seeded with the working tree — uncommitted changes and untr
 non-ignored files included. The user's own working tree is never written to by a Worker.
 _Avoid_: worktree, sandbox, scratch dir
 
+**Thread**:
+The Codex-side conversation one or more Advisory Delegations happen in, named by the `thread_id`
+Codex reports when it opens one. Persisting it is what lets a follow-up continue the same Worker's
+reasoning through `codex exec resume` instead of buying a whole second Delegation of reading. Only
+Advisory Delegations have one; Verifiable Delegations always start clean.
+_Avoid_: session, conversation, continuation id
+
+**Resume Unavailable**:
+What a Delegation reports when the Thread it was asked to continue could not be opened, so the
+Result came from a fresh Delegation that carries none of that conversation. Always stated in the
+Result and in what reaches the Orchestrator — a follow-up silently answered without its context
+reads as continuous when it is not.
+_Avoid_: resume failed, expired session
+
 **Verification Signal**:
 The command, exit code, and pass/fail verdict a Worker reports for a Verifiable Delegation. The
 Worker runs it itself and iterates against it; the Runner does not re-run it. Evidence, not

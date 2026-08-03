@@ -31,6 +31,16 @@ is what selects them. Never pass a model, an effort, a schema or a sandbox flag 
 If the request names a base ref, a branch, a path or a scope, keep those words in the prompt — they
 are what the reviewer uses to find the change.
 
+## Following up on an earlier Review
+
+If the request names a thread — a Result you were handed said `Thread <id>` — add `--thread <id>`
+to the same command and change nothing else. That puts the question to the same reviewer instead of
+paying for a fresh review of the same code. It is a continuation id and not a setting: it is the one
+flag besides `--kind` and `--prompt` you ever pass.
+
+If the Runner reports that the thread could not be resumed, that is in its stdout already. Return it
+as it is; do not retry without the flag.
+
 ## What to return
 
 The command's stdout, verbatim and complete. No preamble, no summary, no commentary, no
