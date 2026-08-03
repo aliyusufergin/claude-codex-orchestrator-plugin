@@ -188,7 +188,7 @@ function currentBranch() {
   return run.status === 0 ? run.stdout.trim() : "unknown";
 }
 
-const DEFAULT_VERIFIABLE = () => ({
+const defaultVerifiable = () => ({
   summary: "ok",
   branch: currentBranch(),
   files_changed: written,
@@ -203,7 +203,7 @@ const DEFAULT_VERIFIABLE = () => ({
 // configure a payload it does not care about.
 const schemaFile = flags["--output-schema"] ?? "";
 const defaultPayload = path.basename(schemaFile) === "verifiable.json"
-  ? DEFAULT_VERIFIABLE()
+  ? defaultVerifiable()
   : DEFAULT_ADVISORY;
 
 const payload = config.payload ?? defaultPayload;

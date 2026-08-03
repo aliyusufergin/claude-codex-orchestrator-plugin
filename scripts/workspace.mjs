@@ -31,7 +31,7 @@ import {
 import path from "node:path";
 
 /** The branch every Workspace is on, named after the Delegation so the two are traceable to each other. */
-export const branchFor = (id) => `delegate/${id}`;
+const branchFor = (id) => `delegate/${id}`;
 
 /**
  * The identity the seed commit is made under. A Workspace is not the user's history, and a seed

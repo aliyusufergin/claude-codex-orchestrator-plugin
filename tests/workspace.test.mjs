@@ -10,10 +10,21 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { createFixtureRepo, flagValue, git, gitStdout, runRunner } from "./helpers/harness.mjs";
+import { isInside, workspaceBase } from "../scripts/workspace.mjs";
 
 const IMPLEMENT = ["delegate", "--kind", "implementation", "--prompt", "make it so"];
 
@@ -40,7 +51,8 @@ function soleWorkspace(fixture) {
 describe("the Workspace", () => {
   it("is a git worktree the Runner owns, and the Worker is put down inside it", async (t) => {
     const fixture = await createFixtureRepo(t);
-    fixture.configureFake({});
+    // The Worker changes something: a Workspace holding nothing is swept, which is its own test.
+    fixture.configureFake({ writeFiles: { "worked.ts": "export const worked = true;\n" } });
 
     const run = await runRunner(fixture, IMPLEMENT);
     assert.equal(run.code, 0, run.stderr);
@@ -59,7 +71,7 @@ describe("the Workspace", () => {
 
   it("branches from the session HEAD, not from the default branch", async (t) => {
     const fixture = await createFixtureRepo(t);
-    fixture.configureFake({});
+    fixture.configureFake({ writeFiles: { "worked.ts": "export const worked = true;\n" } });
 
     // The session is on a branch that is ahead of `main`. Claude Code's own `isolation: worktree`
     // would branch from the default branch, which is why the Runner creates its own (D4).
@@ -83,7 +95,7 @@ describe("the Workspace", () => {
 
   it("is seeded from the working tree: uncommitted changes and untracked, non-ignored files", async (t) => {
     const fixture = await createFixtureRepo(t);
-    fixture.configureFake({});
+    fixture.configureFake({ writeFiles: { "worked.ts": "export const worked = true;\n" } });
 
     writeFileSync(path.join(fixture.repo, ".gitignore"), "*.log\n");
     await git(fixture.repo, ["add", ".gitignore"]);
@@ -119,7 +131,9 @@ describe("the Workspace", () => {
     // The seed is a commit of its own, so that the Worker's change is readable as a diff against
     // one named point — and the branch still starts at the session's `HEAD`.
     assert.equal(await gitStdout(workspace, ["rev-parse", "HEAD~1"]), head);
-    assert.equal(await gitStdout(workspace, ["status", "--porcelain"]), "");
+    // Committed, not left dirty: the only thing outstanding in the Workspace is the Worker's own
+    // change, which is exactly what makes it readable as a diff.
+    assert.equal(await gitStdout(workspace, ["status", "--porcelain"]), "?? worked.ts");
   });
 
   it("never writes to the user's working tree", async (t) => {
@@ -153,7 +167,7 @@ describe("the Workspace", () => {
 
   it("keeps the Workspace out of the directories Codex's sandbox helper mounts over", async (t) => {
     const fixture = await createFixtureRepo(t);
-    fixture.configureFake({});
+    fixture.configureFake({ writeFiles: { "worked.ts": "export const worked = true;\n" } });
 
     // The state directory under the stand-in for `/tmp`: the trap C6 records, where the worktree is
     // shadowed by the helper's own mounts and the Worker's writes vanish without a failure anywhere.
@@ -199,7 +213,7 @@ describe("the Workspace", () => {
 
   it("puts the Worker where the request was made, not at the repository root", async (t) => {
     const fixture = await createFixtureRepo(t);
-    fixture.configureFake({});
+    fixture.configureFake({ writeFiles: { "worked.ts": "export const worked = true;\n" } });
     const inner = path.join(fixture.repo, "packages", "inner");
     mkdirSync(inner, { recursive: true });
     writeFileSync(path.join(inner, "index.ts"), "export const inner = true;\n");
@@ -213,6 +227,22 @@ describe("the Workspace", () => {
       path.join(workspace, "packages", "inner"),
       "the Worker was put down somewhere other than the directory the request came from",
     );
+  });
+
+  it("removes the Workspace when a successful Delegation changed nothing", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    // A legitimate Result: the schema allows an empty `files_changed`, and the summary is then the
+    // whole of it. What must not be left behind is a worktree and a branch nobody will ever use.
+    fixture.configureFake({});
+
+    const run = await runRunner(fixture, IMPLEMENT);
+
+    assert.equal(run.code, 0, run.stderr);
+    assert.deepEqual(fixture.workspaces(), [], "an empty Workspace outlived a completed Delegation");
+    assert.equal(await gitStdout(fixture.repo, ["branch", "--list", "delegate/*"]), "");
+    // And the rendering does not point the Orchestrator at a branch that is not there.
+    assert.match(run.stdout, /No Workspace is left/);
+    assert.doesNotMatch(run.stdout, /Read the diff with/);
   });
 
   it("removes a Workspace the Worker left nothing in, and keeps one it did not", async (t) => {
@@ -238,5 +268,64 @@ describe("the Workspace", () => {
     const workspace = soleWorkspace(fixture);
     assert.equal(readFileSync(path.join(workspace, "half-done.ts"), "utf8"), "export const halfDone = true;\n");
     assert.match(partial.stderr, /left in place/);
+  });
+});
+
+// The one rule here that the process seam cannot state, and the reason it cannot: every fixture
+// directory a test owns is itself under the machine's `/tmp`, so the Runner's `$DELEGATE_TMP_DIR`
+// seam replaces the forbidden set instead of joining it. That makes the CLI test above a test
+// against a stand-in. This asks the rule directly, with the real `/tmp` in the set.
+describe("where a Workspace is allowed to live", () => {
+  it("moves out of a forbidden root rather than trusting the state directory", () => {
+    const { dir, warning } = workspaceBase({
+      stateRoot: "/tmp/delegate-state",
+      codexHome: "/home/someone/.codex",
+      forbidden: ["/tmp"],
+    });
+
+    assert.equal(dir, "/home/someone/.codex/delegate/workspaces");
+    assert.match(warning, /mounts over paths/);
+  });
+
+  it("leaves a state directory outside every forbidden root where it is", () => {
+    const { dir, warning } = workspaceBase({
+      stateRoot: "/home/someone/.codex/delegate",
+      codexHome: "/home/someone/.codex",
+      forbidden: ["/tmp", "/var/tmp"],
+    });
+
+    assert.equal(dir, "/home/someone/.codex/delegate/workspaces");
+    assert.equal(warning, null);
+  });
+
+  it("refuses when there is nowhere left a Worker's writes would survive", () => {
+    // Not a fallback and not a warning: with no safe directory, a Verifiable Delegation reports
+    // success and leaves nothing behind, and nobody in the chain has lied (C6).
+    assert.throws(
+      () =>
+        workspaceBase({
+          stateRoot: "/tmp/state",
+          codexHome: "/tmp/codex-home",
+          forbidden: ["/tmp"],
+        }),
+      /nowhere to put the Workspace/,
+    );
+  });
+
+  it("reads a path through its symlinks, so a symlinked /tmp cannot hide one", (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "delegate-inside-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const link = path.join(root, "link");
+    mkdirSync(path.join(real, "workspaces"), { recursive: true });
+    symlinkSync(real, link);
+
+    // The macOS shape exactly: `/tmp` is a symlink to `/private/tmp`, so a path spelled one way
+    // and a root spelled the other are the same directory.
+    assert.equal(isInside(path.join(link, "workspaces"), real), true);
+    assert.equal(isInside(path.join(real, "workspaces"), link), true);
+    // Including a path that does not exist yet, which is the case that actually matters.
+    assert.equal(isInside(path.join(link, "workspaces", "not-created-yet"), real), true);
+    assert.equal(isInside(root, real), false);
   });
 });

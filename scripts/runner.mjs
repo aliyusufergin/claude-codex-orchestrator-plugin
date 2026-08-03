@@ -470,21 +470,44 @@ function spawnCodex(args, watcher, { cwd }) {
  * Stop this Delegation on the way out. `/delegate:cancel` signals the Runner rather than Codex, so
  * that the Delegation ends the way any other failure does — the Ledger gets its closing observation,
  * the running record is cleared, and the Workspace is disposed of by the same rule as any other run
- * that produced nothing.
+ * that produced nothing. Exiting here instead would skip all three, which is precisely what the
+ * cancellation path exists to avoid.
  *
- * The process is not exited from here: the run has to unwind first, and killing the Worker is what
- * lets it.
+ * So the process is never exited from here. Killing the Worker is what lets the run unwind, and the
+ * flag covers the window before there is one to kill — `spawnCodex` reads it the moment it has a
+ * child. After the Worker has finished there is nothing left to stop: the Delegation is paid for and
+ * its Result is in hand, so the signal is deliberately not honoured rather than discarding it.
  */
 function onCancellation() {
   cancelled = true;
   if (activeChild) activeChild.kill("SIGTERM");
-  else process.exit(EXIT_FAILED);
+}
+
+/**
+ * Whether a Worker filled a string field in at all. Every Result reaches the checks and the
+ * renderings having been reported as imperfect rather than refused, so both halves ask this the
+ * same way: a missing field costs a line, never the answer.
+ */
+function filled(value) {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+/** A Worker's string field, trimmed, or the fallback when it left the field empty. */
+function text(value, fallback = "") {
+  return filled(value) ? value.trim() : fallback;
+}
+
+/** The line every rendering closes with: the Result's id, and where the whole of it is. */
+function resultFooter(id, persisted) {
+  return persisted
+    ? `Result \`${id}\` — the whole payload is at \`/delegate:result ${id}\`.`
+    : `Result \`${id}\` — not persisted, so this rendering is all of it.`;
 }
 
 /** A Worker's text on one line, collapsed and capped — for the places the Runner quotes it inline. */
 function oneLine(value, max = ONE_LINE_MAX_CHARS) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  const collapsed = String(value ?? "").replace(/\s+/g, " ").trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
 }
 
 /** Whatever an event carries as its message, as one line — a string, or the object it hid in. */
@@ -885,7 +908,7 @@ function clearRunning(id) {
 }
 
 /** Every Delegation currently claiming to run, with the dead ones swept as they are found. */
-function runningDelegations({ sweep = true } = {}) {
+function runningDelegations() {
   let entries;
   try {
     entries = readdirSync(runningDir());
@@ -905,7 +928,7 @@ function runningDelegations({ sweep = true } = {}) {
 
     if (processAlive(entry.pid)) {
       live.push(entry);
-    } else if (sweep) {
+    } else {
       // The Runner was killed outright rather than asked to stop, so it never got to clean up.
       // Nothing about the Delegation is recoverable from here beyond the fact that it is over.
       clearRunning(entry.id);
@@ -923,25 +946,33 @@ function runningDelegations({ sweep = true } = {}) {
  * Which of the two this is gets measured rather than guessed, because a Worker that wrote half a
  * change and then died has left something worth keeping.
  */
-function disposeIfEmpty(repoRoot, workspace) {
-  let changes = null;
-  try {
-    changes = workspaceChanges(workspace.path, workspace.seed_commit);
-  } catch {
-    // Unreadable, so unmeasurable, so kept: removing a Workspace on a failure to look inside it is
-    // the one mistake here that destroys work.
-  }
-
-  if (changes !== null && changes.length === 0) {
-    if (removeWorkspace({ repoRoot, ...workspace })) {
-      warn(`the Workspace ${workspace.path} held no change and was removed with its branch`);
-      return;
+function disposeIfEmpty(repoRoot, workspace, changes = null) {
+  let held = changes;
+  if (held === null) {
+    try {
+      held = workspaceChanges(workspace.path, workspace.seed_commit);
+    } catch {
+      // Unreadable, so unmeasurable, so kept: removing a Workspace on a failure to look inside it is
+      // the one mistake here that destroys work.
     }
   }
+
+  if (held !== null && held.length === 0) {
+    if (removeWorkspace({ repoRoot, ...workspace })) {
+      warn(`the Workspace ${workspace.path} held no change and was removed with its branch`);
+    } else {
+      warn(
+        `the Workspace ${workspace.path} holds no change and could not be removed — it and branch` +
+          ` ${workspace.branch} are left behind, and \`git worktree remove\` clears them`,
+      );
+    }
+    return;
+  }
+
   warn(
     `the Workspace ${workspace.path} is left in place on branch ${workspace.branch}` +
-      `${changes === null ? "" : ` with ${changes.length} changed file(s)`} — it is the Worker's` +
-      " unfinished work, and removing it is yours to decide",
+      `${held === null ? "" : ` with ${held.length} changed file(s)`} — it is the Worker's` +
+      " work, and removing it is yours to decide",
   );
 }
 
@@ -1055,7 +1086,6 @@ function advisoryVocabulary() {
 function advisoryProblems(payload) {
   const fatal = [];
   const noted = [];
-  const filled = (value) => typeof value === "string" && value.trim() !== "";
   const lineNumber = (value) => value == null || (Number.isInteger(value) && value >= 1);
   const { verdicts, severities } = advisoryVocabulary();
 
@@ -1144,7 +1174,7 @@ function quoted(text) {
 function renderAdvisory({ id, kind, payload, persisted, thread, thread_id: threadId, resume_unavailable: resumeUnavailable }) {
   // Every field but `evidence` is rendered defensively: a Result reaches here having been reported
   // as imperfect rather than refused, so a missing title costs a line and not the answer.
-  const text = (value, fallback = "") => (typeof value === "string" && value.trim() !== "" ? value.trim() : fallback);
+  //
   // Anything the Worker wrote that lands in one of the Runner's own headings is collapsed to a
   // line first, so that a verdict or a title carrying newlines cannot forge a second heading.
   const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${oneLine(text(payload.verdict, "no verdict"))}`];
@@ -1199,13 +1229,7 @@ function renderAdvisory({ id, kind, payload, persisted, thread, thread_id: threa
     for (const step of nextSteps) out.push(quoted(`- ${String(step).trim()}`));
   }
 
-  out.push(
-    "",
-    "---",
-    persisted
-      ? `Result \`${id}\` — the whole payload is at \`/delegate:result ${id}\`.`
-      : `Result \`${id}\` — not persisted, so this rendering is all of it.`,
-  );
+  out.push("", "---", resultFooter(id, persisted));
   if (threadId) {
     // The one thing that makes a Result continuable (D11). Without it in the rendering, a follow-up
     // costs a whole fresh Delegation, which is the expense resume exists to avoid.
@@ -1243,7 +1267,6 @@ const FILES_MAX = 40;
 function verifiableProblems(payload, { observed, branch }) {
   const fatal = [];
   const noted = [];
-  const filled = (value) => typeof value === "string" && value.trim() !== "";
 
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
     return { fatal: ["the payload is not an object"], noted };
@@ -1331,10 +1354,9 @@ function renderVerifiable({
   persisted,
   workspace,
   observed,
+  kept,
   diffMaxLines,
 }) {
-  const text = (value, fallback = "") =>
-    typeof value === "string" && value.trim() !== "" ? value.trim() : fallback;
   const verification = payload.verification ?? {};
   const passed = verification.passed === true;
   const inverted = payload.expected_failure === true;
@@ -1351,9 +1373,12 @@ function renderVerifiable({
 
   out.push(
     "",
-    `**Workspace** \`${workspace.path}\` on branch \`${workspace.branch}\`, branched from` +
-      ` \`${workspace.head}\` and seeded with the working tree as it stood. Nothing has been Landed:` +
-      " the change is only there.",
+    kept
+      ? `**Workspace** \`${workspace.path}\` on branch \`${workspace.branch}\`, branched from` +
+          ` \`${workspace.head}\` and seeded with the working tree as it stood. Nothing has been` +
+          " Landed: the change is only there."
+      : "**No Workspace is left.** The Worker changed nothing, so the worktree and its branch were" +
+          " removed rather than left behind — there is nothing here to Land.",
   );
 
   const command = text(verification.command, "no command reported");
@@ -1387,16 +1412,12 @@ function renderVerifiable({
     for (const caveat of caveats) out.push(quoted(`- ${String(caveat).trim()}`));
   }
 
-  out.push(
-    "",
-    "---",
-    persisted
-      ? `Result \`${id}\` — the whole payload is at \`/delegate:result ${id}\`.`
-      : `Result \`${id}\` — not persisted, so this rendering is all of it.`,
-    `Read the diff with \`git -C ${workspace.path} diff ${workspace.seed_commit}\`.`,
-  );
+  out.push("", "---", resultFooter(id, persisted));
+  if (kept) {
+    out.push(`Read the diff with \`git -C ${workspace.path} diff ${workspace.seed_commit}\`.`);
+  }
 
-  if (size && diffMaxLines > 0 && size.lines > diffMaxLines) {
+  if (kept && size && diffMaxLines > 0 && size.lines > diffMaxLines) {
     // ADR-0003's other half: the rule withholds autonomous Landing when reading the diff would cost
     // more than the Delegation saved, and this is the moment that is knowable.
     out.push(
@@ -1670,6 +1691,10 @@ async function delegate(args) {
   // How big the Worker says its diff is. Declared here because it is read after the run, by the
   // Ledger's closing observation — the diff sizes O3 needs to calibrate against have no other source.
   let diffLines = null;
+  // What the Workspace held when the run ended. Also read after the run: a Delegation that succeeded
+  // and changed nothing leaves a worktree and a branch behind, and that is the plugin's litter by
+  // the same rule that keeps a half-finished change (D22).
+  let observed = null;
   try {
     const run = {
       prompt: composePrompt(values.kind, request),
@@ -1760,7 +1785,6 @@ async function delegate(args) {
       // What the Workspace actually holds, measured by the Runner rather than reported by the
       // Worker. This is the half of a Verifiable Result that cannot be fabricated, and it is what
       // the Worker's own claims are reconciled against below.
-      let observed;
       try {
         observed = workspaceChanges(workspace.path, workspace.seed_commit);
       } catch (error) {
@@ -1788,6 +1812,9 @@ async function delegate(args) {
         persisted,
         workspace,
         observed,
+        // A Workspace holding nothing is swept below, so the rendering must not point at a branch
+        // that will not be there when the Orchestrator reads it.
+        kept: observed.length > 0,
         diffMaxLines: settings.diff_max_lines,
       });
     } else {
@@ -1820,6 +1847,14 @@ async function delegate(args) {
   }
 
   observe("ok", { rendered_bytes: Buffer.byteLength(rendered), diff_lines: diffLines });
+
+  // A Delegation can succeed and change nothing — the schema calls that a legitimate Result, and the
+  // summary is then the whole of it. What it must not leave behind is a worktree and a branch: those
+  // are the plugin's, not the Worker's unfinished work, and D22's sweep is not there to tidy up
+  // after a run that completed.
+  if (workspace && observed !== null && observed.length === 0) {
+    disposeIfEmpty(repo.root, workspace, observed);
+  }
   // Only a Result the Runner was willing to render is cached, and only an Advisory one. A failed
   // Delegation is not an answer to serve again — it is one to run again, if the Orchestrator still
   // wants it. And a Verifiable Result is a branch in a Workspace (D11, D22): serving it a second

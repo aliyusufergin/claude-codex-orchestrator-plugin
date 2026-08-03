@@ -166,6 +166,14 @@ of work, so that the run is addressable while it happens. `/delegate:status` lis
 record on disk, `/delegate:cancel <id>` signals the Runner that record names, and `/delegate:result
 <id>` retrieves the whole Result afterwards if the notification never arrives.
 
+The cancellation signals the *Runner*, never Codex, and the Runner never exits from its signal
+handler: it kills the Worker and lets the run unwind, so the Delegation ends the way any other
+failure does — Ledger closed, running record cleared, empty Workspace disposed of. A signal arriving
+before the Worker has been spawned is held and honoured the moment there is one to kill; a signal
+arriving after the Worker has finished is deliberately not honoured at all, because the Delegation is
+paid for and its Result is in hand. The Budget is not refunded either way: it counts what was asked
+of the provider, and cancelling does not un-ask it.
+
 **D11 — Advisory Delegations resume; Verifiable are single-shot.** Advisory persists `thread_id`
 and follow-ups continue the thread via `codex exec resume`, so dialogue with a reviewer is cheap.
 Verifiable always starts clean and may pass `--ephemeral`. If a resume attempt fails, the Runner
@@ -240,10 +248,13 @@ against the seed commit plus the untracked files. That is not verification; it i
 of #6 applied to a Class whose Result is a diff. A Worker reporting files that are not there fails
 the Delegation.
 
-*Fourth, an empty Workspace is swept and a written-in one is not.* D22 leaves unlanded work alone
-because it is the user's. A Workspace a failed run wrote nothing into is not that — it is a worktree
-and a branch the plugin left behind — so it is removed with its branch, and the distinction is
-measured rather than assumed.
+*Fourth, an empty Workspace is swept and a written-in one is not*, however the run ended. D22 leaves
+unlanded work alone because it is the user's. A Workspace nothing was written into is not that — it
+is a worktree and a branch the plugin left behind — so it is removed with its branch, and the
+distinction is measured rather than assumed. That covers the *successful* run that changed nothing
+as well as the failed one: the schema calls an empty `files_changed` a legitimate Result, and D22's
+sweep is not there to tidy up after a run that completed. The rendering says which of the two
+happened, so it never points at a branch that is not there.
 
 **D22 — A Delegation outlives its session.** `SessionEnd` collects only Workspaces that are
 finished-and-Landed or untouched. A running Worker is left alone: its Budget is already spent, and
