@@ -175,6 +175,71 @@ describe("event-stream reconciliation", () => {
     assert.match(run.stdout, /reviewed against HEAD~1 instead/);
   });
 
+  it("fails the run codex-cli 0.146.0 actually produced when a tool call was denied", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    // Every shape below is verbatim from one real run — `docs/research/exec-event-stream-shape.md`.
+    // The rejected write produced no item at all: no error item, no `turn.failed`, no item with
+    // `status: "failed"`. The stream is clean, the exit code is 0, and the only trace is on stderr,
+    // alongside the MCP client noise that lands there on every run.
+    const payload = {
+      verdict: "blocking",
+      summary: "Creating probe-ok.txt failed because the workspace is read-only.",
+      findings: [
+        advisoryFinding({
+          title: "Writing probe-ok.txt failed",
+          file: "probe-ok.txt",
+          line_start: null,
+          line_end: null,
+          evidence: "patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings",
+          confidence: 1,
+        }),
+      ],
+      next_steps: [],
+    };
+    fixture.configureFake({
+      events: [
+        { type: "thread.started", thread_id: "019fc78b-4ab7-73c2-a23f-25054c0ded71" },
+        { type: "turn.started" },
+        {
+          // A preamble the Worker superseded — the reconciliation must quote the last claim, not this.
+          type: "item.completed",
+          item: {
+            id: "item_0",
+            type: "agent_message",
+            text: JSON.stringify({ verdict: "concerns", summary: "I'll attempt the requested write first.", findings: [], next_steps: [] }),
+          },
+        },
+        {
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "command_execution",
+            command: "/usr/bin/zsh -lc \"sed -n '1,240p' token.js\"",
+            aggregated_output: "export function expired(token, now) {\n  return token.expiresAt < now;\n}\n",
+            exit_code: 0,
+            status: "completed",
+          },
+        },
+        { type: "item.completed", item: { id: "item_2", type: "agent_message", text: JSON.stringify(payload) } },
+        { type: "turn.completed", usage: { input_tokens: 47850, cached_input_tokens: 30208, output_tokens: 503 } },
+      ],
+      payload,
+      stderr:
+        "2026-08-03T12:13:43.734066Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired\n" +
+        "2026-08-03T12:13:54.910296Z ERROR codex_core::tools::router: error=patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings\n",
+      exitCode: 0,
+    });
+
+    const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
+
+    assert.notEqual(run.code, 0, "the run that produced nothing was reported as a success");
+    assert.equal(run.stdout, "");
+    assert.match(run.stderr, /patch rejected/);
+    // The last claim, not the preamble the Worker superseded.
+    assert.match(run.stderr, /Creating probe-ok\.txt failed/);
+    assert.doesNotMatch(run.stderr, /I'll attempt the requested write first/);
+  });
+
   it("quotes the Worker's verdict and summary when its closing message is the payload", async (t) => {
     const fixture = await createFixtureRepo(t);
     // `--output-schema` makes the closing message the payload itself, double-encoded — so the

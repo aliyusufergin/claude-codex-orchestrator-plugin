@@ -419,10 +419,11 @@ function workerClaim(text) {
  * the exit code said success, and stderr carries unrelated MCP client noise on every run — so both
  * are read here and reconciled against the Worker's own claim, and the failure names both halves.
  *
- * The two channels carry different things. The event stream is where a failed turn, a failed tool
- * call and the Worker's closing claim appear. The tool-router error is matched on stderr, by name,
- * because that is where probe case C put the whole trace of a silent failure — one signature, not
- * "stderr said something".
+ * The two channels carry different things. A rejected tool call produces no event at all — measured
+ * on codex-cli 0.146.0, where a write denied by `-s read-only` left a clean stream, an exit code of
+ * `0`, and one `codex_core::tools::router` line on stderr. So that signature is matched on stderr
+ * by name — one signature, not "stderr said something" — and the event stream is read for what does
+ * appear there: a failed turn, an error, and the Worker's closing claim.
  *
  * A tool-router error is treated as a failed Delegation even if the Worker went on to work around
  * it. That is deliberate: a Worker that recovered will be delegated again at the cost of one
@@ -463,8 +464,9 @@ function watchRun() {
 
     const item = event.item;
     if (item === null || typeof item !== "object") return;
-    // The item's details are a tagged union, flattened onto the item in the shape `codex exec`
-    // emits today and nested under `details` in the shape its own types describe.
+    // Measured flat on codex-cli 0.146.0 — serde flattens the tagged union its own types nest
+    // under `details`. The nested shape is read too, at the cost of one expression: guessing wrong
+    // here does not fail loudly, it silently stops a failure signal from being seen.
     const detail = item.details && typeof item.details === "object" ? item.details : item;
 
     if (detail.type === "agent_message") {

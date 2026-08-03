@@ -37,7 +37,8 @@ regress on. `codex exec` hangs forever if it inherits an open stdin. It writes u
 client errors to stderr, so stderr on its own is not a failure signal. And it can exit `0` while
 its work failed outright — observed during the [sandbox probe](../research/sandbox-nesting-probe.md),
 where a Worker emitted `file_change` events, claimed success, and wrote nothing. Neither the exit
-code nor stderr can be trusted alone: the Runner reads a failed turn, a failed tool call and the
-Worker's closing claim off the JSONL event stream, matches the one tool-router signature that
-probe case C put on stderr and nowhere else, and reconciles the two against each other. This is
-what a Verification Signal actually rests on.
+code nor stderr can be trusted alone: the Runner matches the one `codex_core::tools::router`
+signature that a rejected tool call puts on stderr and nowhere else — measured again on an ordinary
+run, where it left no event behind at all — reads a failed turn, an error and the Worker's closing
+claim off the JSONL event stream, and reconciles the two against each other. This is what a
+Verification Signal actually rests on.

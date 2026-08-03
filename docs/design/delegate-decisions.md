@@ -233,13 +233,19 @@ All measured, not assumed. Detail in the research documents.
 
 - `codex exec` **hangs forever on an inherited open stdin** — redirect from `/dev/null`.
 - **stderr is not a failure signal** — unrelated MCP client errors land there on every run. One
-  named signature on it is: `codex_core::tools::router`, which is where probe case C left the whole
-  trace of a silent failure. Matching it by name is not the same as reading stderr for failure.
+  named signature on it is: `codex_core::tools::router`, and it is the *only* trace a rejected tool
+  call leaves anywhere. Matching it by name is not the same as reading stderr for failure.
+- **A rejected tool call produces no event** — measured on 0.146.0: a write denied by `-s read-only`
+  left no `error` item, no `turn.failed`, no item reporting `status: "failed"`, and exit code `0`
+  ([event-stream shape](../research/exec-event-stream-shape.md)).
 - **The exit code is not a failure signal either** — a Delegation can fail completely and exit `0`.
-  The Runner reads a failed turn, a failed tool call and the Worker's closing claim off the JSONL
-  event stream, and reconciles those and the tool-router signature against the Worker's claims. A
-  command the Worker ran that exited non-zero is work, not failure, and is not reconciled against.
-  This is what a Verification Signal actually rests on. *(Implemented on #6.)*
+  The Runner matches the tool-router signature on stderr, reads a failed turn, an error and the
+  Worker's closing claim off the JSONL event stream, and reconciles the two. A command the Worker
+  ran that exited non-zero is work, not failure, and is not reconciled against. This is what a
+  Verification Signal actually rests on. *(Implemented on #6.)*
+- **Items are flat on the wire** — detail fields sit directly on `item`, not under `details`.
+- **The closing `agent_message.text` is the payload** under `--output-schema`, double-encoded — and
+  there may be more than one `agent_message` in a turn, the last being the Result.
 - **`$CODEX_HOME` must be writable**, `--ephemeral` or not, or Codex dies before emitting an event.
 - `--output-schema` + `-o <file>` writes the payload already unwrapped; the same payload inside the
   event stream is double-encoded (a JSON string in `agent_message.text`).
