@@ -88,11 +88,17 @@ The Worker reported its own failure honestly here (`"verdict":"blocking"`, "Crea
 failed because the workspace is read-only"), which is the behaviour run 2 of the sandbox probe also
 saw and case C did not. Candour is model-dependent; the router signature is not.
 
-But it exposes a false-failure class the reconciler currently accepts. An Advisory Delegation runs
-`read-only` by design, so *any* write the Worker attempts is denied and emits this signature — and
-an Advisory Result is prose from reading, which a denied write does not invalidate. Under the
-present rule that run's Result is discarded and its Delegation Budget spent for nothing. Open, and
-noted on #6 rather than decided here.
+But it exposed a false-failure class. An Advisory Delegation runs `read-only` by design, so *any*
+write the Worker attempts is denied and emits this signature — and an Advisory Result is prose from
+reading, which a denied write does not invalidate. Under the rule as first written that run's
+Result was discarded and its Delegation Budget spent for nothing.
+
+Resolved by the Delegation Class, on #6 (C7 in the [decision log](../design/delegate-decisions.md)):
+for Advisory, a router error whose text names a policy denial of a write is reported on stderr and
+is not a failure; every other router error still is, which is what keeps probe case E — where the
+read-only sandbox stopped the Worker reading at all — a failure. For Verifiable the same denial is
+the failure itself. A Review Delegation independently reached the same conclusion about this code,
+at confidence 0.99.
 
 ## What is still unmeasured
 

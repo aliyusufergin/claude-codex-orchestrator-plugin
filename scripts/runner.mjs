@@ -112,6 +112,22 @@ const CLAIM_MAX_CHARS = 240;
  */
 const TOOL_ROUTER_ERROR = /codex_core::tools::router/;
 
+/**
+ * The tool-router errors that are Codex's own sandbox refusing a write rather than a tool call
+ * failing. Measured on 0.146.0: `patch rejected: writing is blocked by read-only sandbox; rejected
+ * by user approval settings`.
+ *
+ * An Advisory Delegation runs `read-only` by design, so a write it attempts is denied by policy and
+ * its Result — prose from reading — is unaffected. Failing it there would discard a usable Result
+ * and spend the Delegation Budget for nothing. Verifiable is the opposite case: a denied write is
+ * precisely the silent failure probe case C recorded, whose text is different (`Failed to write
+ * file`) and does not match this.
+ *
+ * Matching one message is brittle across Codex versions, and it breaks the safe way: a wording
+ * change costs a false failure, which is visible and paid for once, not a missed one.
+ */
+const WRITE_DENIED_BY_POLICY = /patch rejected|read-only sandbox/i;
+
 const SANDBOX_BY_CLASS = {
   advisory: "read-only",
   verifiable: "workspace-write",
@@ -429,9 +445,10 @@ function workerClaim(text) {
  * it. That is deliberate: a Worker that recovered will be delegated again at the cost of one
  * Delegation, whereas a fabricated Result accepted as real costs the user their code.
  */
-function watchRun() {
+function watchRun({ delegationClass }) {
   const failures = [];
   let claim = null;
+  let deniedWrite = false;
   let stdoutRest = "";
   let stderrRest = "";
 
@@ -494,7 +511,21 @@ function watchRun() {
   }
 
   function readDiagnostic(line) {
-    if (TOOL_ROUTER_ERROR.test(line)) note(`Codex's tool router reported an error: ${oneLine(line)}`);
+    if (!TOOL_ROUTER_ERROR.test(line)) return;
+
+    if (delegationClass === "advisory" && WRITE_DENIED_BY_POLICY.test(line)) {
+      // Reported rather than failed, and reported once: the Orchestrator's copy of the Result is
+      // unaffected by a write that never happened, but a Worker reaching for one is worth seeing.
+      if (!deniedWrite) {
+        deniedWrite = true;
+        process.stderr.write(
+          "the Worker attempted a write and Codex's read-only sandbox denied it, as an Advisory" +
+            " Delegation requires: not treated as a failure\n",
+        );
+      }
+      return;
+    }
+    note(`Codex's tool router reported an error: ${oneLine(line)}`);
   }
 
   const feed = (rest, chunk, consume) => {
@@ -557,7 +588,7 @@ function renderFailure({ codex, failures, claim }) {
  * `--output-schema` plus `-o <file>` writes the payload already unwrapped, while the copy in the
  * event stream's `agent_message.text` is double-encoded — so the file is the source.
  */
-async function runCodex({ prompt, cwd, sandbox, schema, extraArgs = [] }) {
+async function runCodex({ prompt, cwd, sandbox, schema, delegationClass, extraArgs = [] }) {
   // The payload directory is not under `/tmp`: Codex's sandbox helper mounts over paths there,
   // and a file it shadows is written, reported as written, and absent afterwards (ADR-0004).
   // `$CODEX_HOME` is the one directory the Runner has already established is writable.
@@ -587,7 +618,7 @@ async function runCodex({ prompt, cwd, sandbox, schema, extraArgs = [] }) {
   ];
 
   try {
-    const watcher = watchRun();
+    const watcher = watchRun({ delegationClass });
     const { code, signal, spawnError } = await spawnCodex(args, watcher);
 
     // A spawn failure is not a run: there is no stream, no claim and nothing to reconcile.
@@ -872,6 +903,7 @@ async function delegate(args) {
     cwd,
     sandbox: mode,
     schema: SCHEMA_BY_CLASS[delegationClass],
+    delegationClass,
     extraArgs: effortArgs,
   });
 

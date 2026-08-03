@@ -175,7 +175,7 @@ describe("event-stream reconciliation", () => {
     assert.match(run.stdout, /reviewed against HEAD~1 instead/);
   });
 
-  it("fails the run codex-cli 0.146.0 actually produced when a tool call was denied", async (t) => {
+  it("returns the Advisory Result of the run codex-cli 0.146.0 actually produced", async (t) => {
     const fixture = await createFixtureRepo(t);
     // Every shape below is verbatim from one real run — `docs/research/exec-event-stream-shape.md`.
     // The rejected write produced no item at all: no error item, no `turn.failed`, no item with
@@ -232,12 +232,46 @@ describe("event-stream reconciliation", () => {
 
     const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
 
-    assert.notEqual(run.code, 0, "the run that produced nothing was reported as a success");
+    // The write was denied because an Advisory Delegation runs read-only, which is the policy
+    // working. The Result is prose from reading, which the denied write did not touch — failing it
+    // would discard a usable Result and spend the Delegation Budget for nothing.
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stdout, /Creating probe-ok\.txt failed/);
+    // Visible, not silent: a Worker reaching for a write is worth seeing on the diagnostic channel.
+    assert.match(run.stderr, /denied it/);
+  });
+
+  it("fails a Verifiable run on the same denial, where a blocked write is the whole failure", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({
+      events: wroteFilesAndClaimed("The fix is in."),
+      stderr:
+        "2026-08-03T12:13:54.910296Z ERROR codex_core::tools::router: error=patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings\n",
+      exitCode: 0,
+    });
+
+    const run = await runRunner(fixture, ["delegate", "--kind", "implementation", "--prompt", "fix it"]);
+
+    assert.notEqual(run.code, 0, "a Verifiable Delegation that wrote nothing was reported as done");
     assert.equal(run.stdout, "");
     assert.match(run.stderr, /patch rejected/);
-    // The last claim, not the preamble the Worker superseded.
-    assert.match(run.stderr, /Creating probe-ok\.txt failed/);
-    assert.doesNotMatch(run.stderr, /I'll attempt the requested write first/);
+  });
+
+  it("still fails an Advisory run whose tool call failed for any other reason", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    // Probe case C's text, which is a tool call that failed rather than a write denied by policy —
+    // and probe case E's shape, where the read-only sandbox stopped the Worker reading at all, is
+    // the reason this carve-out is not "Advisory ignores the router".
+    fixture.configureFake({
+      events: wroteFilesAndClaimed("Reviewed the diff."),
+      stderr: TOOL_ROUTER_STDERR,
+      exitCode: 0,
+    });
+
+    const run = await runRunner(fixture, ["delegate", "--kind", "review", "--prompt", "hello"]);
+
+    assert.notEqual(run.code, 0);
+    assert.equal(run.stdout, "");
   });
 
   it("quotes the Worker's verdict and summary when its closing message is the payload", async (t) => {

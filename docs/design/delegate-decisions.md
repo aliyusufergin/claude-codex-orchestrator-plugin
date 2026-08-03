@@ -225,6 +225,17 @@ afterwards. The payload directory the Runner hands Codex moved from `tmpdir()` t
 #4, which lands C5's preferred path; the Workspace itself is still #9's to place. *(Raised on #9
 and #4.)*
 
+**C7 — Which tool-router errors fail a Delegation is decided by the Delegation Class.** #6's
+criterion is blunt: any tool-router error fails the run, whatever the exit code. Measured against
+real Codex, that is wrong for Advisory. An Advisory Delegation runs `read-only` by design, so every
+write the Worker attempts is denied by policy and emits the router signature — while the Result,
+prose from reading, is untouched by a write that never happened. So a router error naming a policy
+denial of a write is reported and not failed **for Advisory only**; every other router error still
+fails it, which is what keeps probe case E — the read-only sandbox stopping the Worker reading at
+all — a failure. For Verifiable the same denial *is* the failure, and probe case C's text differs
+from it. *(Measured and landed on #6; a Review Delegation reached the same conclusion
+independently.)*
+
 ---
 
 ## Transport facts the implementation must respect
