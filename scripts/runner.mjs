@@ -1280,7 +1280,7 @@ const FILES_MAX = 40;
  *
  * `observed` is what the Workspace actually holds, measured against the commit it was seeded at.
  */
-function verifiableProblems(payload, { observed, branch }) {
+function verifiableProblems(payload, { kind, observed, branch }) {
   const fatal = [];
   const noted = [];
 
@@ -1324,6 +1324,15 @@ function verifiableProblems(payload, { observed, branch }) {
   if (!Array.isArray(payload.caveats)) noted.push("caveats is not an array");
   if (!(payload.expected_failure == null || typeof payload.expected_failure === "boolean")) {
     noted.push("expected_failure is not a boolean or null");
+  }
+  // C1: the field is Repro's and only Repro's. Noted rather than fatal — the rendering derives the
+  // inversion from the Task Kind either way, so a Worker that filled this in wrongly costs a line
+  // and not the Result.
+  if (kind === "repro" && payload.expected_failure !== true) {
+    noted.push("expected_failure is not true on a Repro, whose Verification Signal is inverted");
+  }
+  if (kind !== "repro" && payload.expected_failure === true) {
+    noted.push(`expected_failure is true on a ${kind}, and the inverted signal belongs to Repro`);
   }
 
   const stat = payload.diff_stat;
@@ -1375,14 +1384,34 @@ function renderVerifiable({
 }) {
   const verification = payload.verification ?? {};
   const passed = verification.passed === true;
-  const inverted = payload.expected_failure === true;
+  // Whether the command failing is this Delegation's success condition (C1). Read from the Task Kind
+  // as well as from the Worker's own field: the inversion is a property of Repro, and a Worker that
+  // forgot to set `expected_failure` would otherwise have its passing test headlined as a success —
+  // which is the exact misreading the inversion exists to prevent.
+  const inverted = kind === "repro" || payload.expected_failure === true;
 
   const headline = passed
     ? inverted
       ? "verification failed, as this Task Kind requires"
       : "verification passed"
-    : "verification did not pass";
+    : inverted
+      ? "the command passed, so the test is wrong"
+      : "verification did not pass";
   const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${headline}`];
+
+  if (inverted && !passed) {
+    // C1 on the surface the Orchestrator actually reads. A Repro whose test passes has produced a
+    // test of the behaviour the code already has, and the one repair that is never correct here is
+    // changing the code — an Orchestrator reading "did not pass" as an ordinary red build would
+    // reach for exactly that.
+    out.push(
+      "",
+      "**The test does not fail, so it does not capture the bug.** A Repro's signal is inverted: the" +
+        " test is correct precisely when it fails. A passing test means the test is wrong and must be" +
+        " fixed — never that the code needs changing. Do not change the code to make it fail, and do" +
+        " not read this as the bug being absent or already fixed.",
+    );
+  }
 
   const summary = text(payload.summary);
   if (summary) out.push("", quoted(summary));
@@ -1823,6 +1852,7 @@ async function delegate(args) {
       }
 
       const { fatal, noted } = verifiableProblems(resultRecord.payload, {
+        kind: values.kind,
         observed,
         branch: workspace.branch,
       });

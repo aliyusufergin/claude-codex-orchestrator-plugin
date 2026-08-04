@@ -1,7 +1,12 @@
 // Seam 2 — the asset lint. The shipped markdown and JSON never pass through the Runner, so
 // nothing else notices when they break. This lint grows one assertion per shipped asset; today
-// the plugin ships a manifest, two output schemas, four Forwarders, five commands and four prompt
+// the plugin ships a manifest, two output schemas, six Forwarders, five commands and six prompt
 // templates.
+//
+// One assertion here is not bookkeeping: C1, that Repro's prompt template states its inverted
+// verification semantics. A Worker following the general instruction to iterate until the build is
+// green will "fix" the failing test and destroy the task, so those sentences are the task, and this
+// is what stops them being tidied away by someone shortening a prompt.
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -44,6 +49,15 @@ function readAsset(...segments) {
     if (field) frontmatter[field[1]] = field[2].trim();
   }
   return { frontmatter, body: match[2] };
+}
+
+/**
+ * A shipped asset as one flowed line — every run of whitespace collapsed to a single space. The
+ * templates are hard-wrapped prose, so a sentence a lint asks for is as likely to be split across
+ * two lines as not, and a regexp that fails on the wrap is a lint that fires on reformatting.
+ */
+function flowed(...segments) {
+  return readFileSync(path.join(REPO_ROOT, ...segments), "utf8").replace(/\s+/g, " ");
 }
 
 describe("plugin manifest", () => {
@@ -136,10 +150,25 @@ describe("output schemas", () => {
 /** The three Advisory Task Kinds. */
 const ADVISORY_KINDS = ["review", "diagnosis", "adversarial"];
 
-/** The Verifiable Task Kinds that ship a Forwarder. Repro and Migration follow Implementation. */
-const VERIFIABLE_KINDS = ["implementation"];
+/** The three Verifiable Task Kinds. */
+const VERIFIABLE_KINDS = ["implementation", "repro", "migration"];
 
-for (const kind of [...ADVISORY_KINDS, ...VERIFIABLE_KINDS]) {
+/** All six Task Kinds (D3). Every one of them ships a prompt template and a Forwarder. */
+const ALL_KINDS = [...ADVISORY_KINDS, ...VERIFIABLE_KINDS];
+
+describe("the Task Kinds", () => {
+  it("are the six of D3, and each ships one Forwarder and nothing else does", () => {
+    // A seventh Forwarder, or a Forwarder for a Task Kind the Runner does not know, is a routing
+    // target the Orchestrator can reach and the Runner rejects as a usage error.
+    assert.equal(ALL_KINDS.length, 6, ALL_KINDS.join(", "));
+    assert.deepEqual(
+      readdirSync(path.join(REPO_ROOT, "agents")).sort(),
+      ALL_KINDS.map((kind) => `${kind}.md`).sort(),
+    );
+  });
+});
+
+for (const kind of ALL_KINDS) {
   const advisory = ADVISORY_KINDS.includes(kind);
 
   describe(`the ${kind} Forwarder`, () => {
@@ -362,7 +391,7 @@ describe("prompt templates", () => {
     });
   }
 
-  for (const kind of [...ADVISORY_KINDS, ...VERIFIABLE_KINDS]) {
+  for (const kind of ALL_KINDS) {
     it(`ships one for ${kind}`, () => {
       // A Task Kind with no template still runs — the Runner sends the request on its own and says
       // so — which is exactly the silent-ish degradation this lint exists to catch before release.
@@ -389,6 +418,52 @@ describe("prompt templates", () => {
     // pass by changing what the command checks. Nothing downstream can tell that from a real pass.
     const template = readFileSync(path.join(REPO_ROOT, "prompts", "implementation.md"), "utf8");
     assert.match(template, /weakened, skipped, or deleted/i);
+  });
+
+  it("states Repro's inverted verification semantics, which is the point of this lint", () => {
+    // C1, and the one sentence in this plugin that cannot be allowed to erode. Every other
+    // Verifiable prompt tells the Worker to iterate until the command passes; a Repro Worker
+    // carrying that instruction "fixes" its own failing test, or edits the code until it fails, and
+    // either way the Delegation is spent producing the opposite of what was asked for.
+    // Read as one flowed line: these templates are hard-wrapped prose, and a sentence that is
+    // present but broken across two lines is still the sentence this lint is asking for.
+    const template = flowed("prompts", "repro.md");
+
+    // The inversion itself: correct when it fails, and what a pass therefore means.
+    assert.match(template, /correct precisely when it fails/i, "repro does not state the inversion");
+    assert.match(
+      template,
+      /passing test means the test is wrong/i,
+      "repro does not say what a passing test means",
+    );
+    // The half that stops the repair going the wrong way. "The test is wrong" without this reads as
+    // an invitation to make the code wrong instead, which is the more expensive of the two mistakes.
+    assert.match(
+      template,
+      /never that the code needs changing/i,
+      "repro does not rule out changing the code",
+    );
+    assert.match(
+      template,
+      /do not change the code under test to make it fail/i,
+      "repro does not forbid sabotaging the code to manufacture a failure",
+    );
+    // The field the inversion travels back in, so the Runner and the reader see the same thing.
+    assert.match(template, /expected_failure/, "repro never says which field carries the inversion");
+    assert.match(
+      template,
+      /not fixing the bug|do not fix the bug/i,
+      "repro does not say the bug is left unfixed",
+    );
+  });
+
+  it("frames Migration's correctness as the build or the test suite across many files", () => {
+    // D3's definition of the Kind: nobody reads a thousand-line diff, so what establishes the change
+    // is the suite plus the uniformity a reader can sample for (ADR-0003).
+    const template = flowed("prompts", "migration.md");
+    assert.match(template, /many files/i);
+    assert.match(template, /build or the test suite/i);
+    assert.match(template, /sample/i, "migration never says how its diff gets read");
   });
 
   it("frames Implementation by intent rather than by mechanism", () => {
