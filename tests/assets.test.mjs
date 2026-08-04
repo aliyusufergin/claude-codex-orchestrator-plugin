@@ -1,19 +1,22 @@
 // Seam 2 — the asset lint. The shipped markdown and JSON never pass through the Runner, so
 // nothing else notices when they break. This lint grows one assertion per shipped asset; today
-// the plugin ships a manifest, two output schemas, six Forwarders, six commands, one hook
-// declaration and six prompt templates.
+// the plugin ships a manifest, two output schemas, six Forwarders, seven commands, one hook
+// declaration, six prompt templates and a README.
 //
-// Two assertions here are not bookkeeping. C1, that Repro's prompt template states its inverted
+// Three assertions here are not bookkeeping. C1, that Repro's prompt template states its inverted
 // verification semantics: a Worker following the general instruction to iterate until the build is
 // green will "fix" the failing test and destroy the task, so those sentences are the task, and this
-// is what stops them being tidied away by someone shortening a prompt. And D15, that no `Stop` hook
+// is what stops them being tidied away by someone shortening a prompt. D15, that no `Stop` hook
 // is declared: what it lints is the *absence* of an asset, which is the one thing no other test in
-// this repository can notice going missing.
+// this repository can notice going missing. And the README's account of `-s danger-full-access`,
+// which is the one document that has to tell the truth about a frightening flag — a paragraph
+// deleted for reading badly is a user who never learns what the plugin does under a sandbox.
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
+import { SETTINGS } from "../scripts/config.mjs";
 import { REPO_ROOT } from "./helpers/harness.mjs";
 
 /** Directories whose contents Claude Code loads as plugin assets. */
@@ -402,6 +405,32 @@ describe("/delegate:clean", () => {
   });
 });
 
+describe("/delegate:setup", () => {
+  const { frontmatter, body } = readAsset("commands", "setup.md");
+
+  it("is the user's command, not the model's", () => {
+    // What it reports is a list of things for the user to decide: a login, two sandbox allowances,
+    // a Budget ceiling. An Orchestrator that could invoke it would be reading its own permissions.
+    assert.equal(frontmatter["disable-model-invocation"], "true");
+    assert.match(body, /runner\.mjs" ready --setup/);
+  });
+
+  it("runs the same readiness check the session-start hook does", () => {
+    // D15: one check, two callers. A `/delegate:setup` with its own idea of what readiness means
+    // would pass a session the hook had already failed, or the reverse.
+    assert.match(body, /session start/i);
+  });
+
+  it("tells the Orchestrator not to carry out the remedies itself", () => {
+    // Every remedy is a decision about what a third-party agent may see or spend. An Orchestrator
+    // that added the write allowance or raised the ceiling would be answering for the user.
+    const prose = flowed("commands", "setup.md");
+    assert.match(prose, /do not run `codex login` for them/i);
+    assert.match(prose, /do not edit their Claude Code settings/i);
+    assert.match(prose, /do not raise the Delegation Budget ceiling/i);
+  });
+});
+
 describe("the hooks", () => {
   /** Every hook declaration the plugin ships, by the file it is declared in. */
   const declarations = assetFiles
@@ -420,6 +449,19 @@ describe("the hooks", () => {
           " lint cannot look inside — declare them inline, or teach it to follow the path",
       );
     }
+  });
+
+  it("check readiness at session start, and nothing else", () => {
+    // D15's other half. Readiness is what turns "the Delegation died and said nothing useful" into
+    // a message before anything was delegated, and it is the only thing this plugin does unasked
+    // at the start of a session.
+    const commands = declarations.flatMap(([, hooks]) =>
+      (hooks.SessionStart ?? []).flatMap((matcher) =>
+        (matcher.hooks ?? []).map((hook) => hook.command),
+      ),
+    );
+    assert.equal(commands.length, 1, commands.join(", "));
+    assert.match(commands[0], /runner\.mjs" ready/);
   });
 
   it("run the narrow session-end collection of D22, and nothing else at session end", () => {
@@ -444,6 +486,64 @@ describe("the hooks", () => {
       );
     }
     assert.ok(declarations.length > 0, "no hook declaration was found to check at all");
+  });
+});
+
+describe("the README", () => {
+  // Read as one flowed line: it is hard-wrapped prose, and a sentence this lint asks for is as
+  // likely to be split across two lines as not.
+  const readme = flowed("README.md");
+
+  it("explains `-s danger-full-access` rather than hiding it", () => {
+    // The one thing in this plugin that cannot be documented by omission. Each clause is asserted
+    // separately because each is a different half of the truth, and dropping any one of them
+    // leaves a paragraph that is honest-sounding and misleading.
+    assert.match(readme, /danger-full-access/);
+    // Why it is reached at all: with the helper's precondition missing it is what runs.
+    assert.match(readme, /only configuration that \*?runs\*?|only configuration that works/i);
+    // Why it is not the widening it looks like.
+    assert.match(readme, /widens nothing/i);
+    assert.match(readme, /outer jail is enforcing the boundary either way/i);
+    // And the corollary, which is the opposite of what the flag name suggests.
+    assert.match(readme, /own\*{0,2} sandbox on/i);
+    assert.match(readme, /safe case/i);
+    assert.match(readme, /conditional, never a default/i);
+  });
+
+  it("names the two write allowances and the domain allowance a sandboxed user needs", () => {
+    // C5 and O2. Both are preconditions nobody told the user about, and both otherwise arrive as
+    // a Delegation that fails in a way that names neither.
+    assert.match(readme, /sandbox\.filesystem\.allowWrite/);
+    assert.match(readme, /sandbox\.network\.allowedDomains/);
+    assert.match(readme, /\$?CODEX_HOME/);
+    assert.match(readme, /\/tmp/);
+  });
+
+  it("documents the environment allowlist and how to extend it", () => {
+    // O5. A user who cannot see the list cannot tell a build failing for want of a variable from
+    // one failing for any other reason.
+    assert.match(readme, /DELEGATE_ENV_ALLOWLIST/);
+    assert.match(readme, /CODEX_API_KEY/);
+    assert.match(readme, /OPENAI_API_KEY/);
+  });
+
+  it("says the numeric defaults are provisional and pending calibration", () => {
+    // O3. Every one of them is a first guess, and a README that printed them as settings would be
+    // handing over a measurement nobody took.
+    assert.match(readme, /provisional/i);
+    assert.match(readme, /calibrat/i);
+    for (const spec of Object.values(SETTINGS)) assert.match(readme, new RegExp(spec.env));
+  });
+
+  it("states how the Runner is invoked, and that no shim or permission rule ships", () => {
+    assert.match(readme, /node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/runner\.mjs"/);
+    assert.match(readme, /no `bin\/` shim and no permission-rule strategy/i);
+    assert.match(readme, /harness's concern/i);
+  });
+
+  it("says the plugin ships off, and why installing is not consenting", () => {
+    assert.match(readme, /defaultEnabled: false/);
+    assert.match(readme, /installing.{0,200}not the same act/i);
   });
 });
 

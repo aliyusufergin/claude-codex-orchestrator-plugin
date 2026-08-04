@@ -146,6 +146,15 @@ read and checked against the code. It authorises the Orchestrator to act on a ve
 finding or to Land a diff it has read, and withholds that authority when reading the diff would
 cost more than the Delegation saved — at which point the decision returns to the user.
 
+**Readiness**:
+What the plugin measures about a machine and a session before anything is delegated: the Codex
+binary, the login as the Worker's own filtered environment carries it, the two directories that must
+be writable, the Budget, and — under an outer sandbox — the provider's host. Every one of them is a
+failure that otherwise surfaces minutes later as a Delegation that dies without naming its cause, so
+what it produces is the remedy rather than the verdict. A check fails only when it means nothing can
+be delegated at all; a state the user can weigh, including the unverified platform, warns instead.
+_Avoid_: health check, preflight, doctor
+
 **Collection**:
 Removing a Workspace and the branch it holds. What ends a session collects only the Workspaces that
 are finished-and-Landed or untouched — a running Delegation keeps its Workspace, and an unlanded

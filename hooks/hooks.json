@@ -1,6 +1,17 @@
 {
-  "description": "SessionEnd collects the Workspaces the plugin left behind — the Landed and the untouched, nothing else. A running Delegation and an unlanded branch both survive the session. No Stop hook ships, not even disabled: full autonomy already covers it, and a stop-time review gate would compete with the Delegation Budget for the same window.",
+  "description": "SessionStart checks readiness — the Codex binary, the login, the two write allowances a sandboxed user needs, the provider's host when something is nesting, and the Budget — so that what would otherwise be a Delegation dying minutes later without explaining itself is a message before anything is delegated. No matcher: a resumed or cleared session has the same preconditions as a fresh one, and none of them is measured until it is asked. SessionEnd collects the Workspaces the plugin left behind — the Landed and the untouched, nothing else. A running Delegation and an unlanded branch both survive the session. No Stop hook ships, not even disabled: full autonomy already covers it, and a stop-time review gate would compete with the Delegation Budget for the same window.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/runner.mjs\" ready",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
