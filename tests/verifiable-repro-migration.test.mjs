@@ -97,7 +97,31 @@ describe("the Repro Delegation", () => {
     // field null would otherwise have its passing test headlined as a success, which is the exact
     // misreading C1 exists to prevent.
     assert.match(run.stdout, /the command passed, so the test is wrong/);
-    assert.match(run.stderr, /expected_failure is not true on a Repro/);
+    assert.match(run.stderr, /expected_failure is not true on a repro/);
+  });
+
+  it("does not call a test that never ran a passing one", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({
+      writeFiles: REPRO_TEST,
+      payload: reproPayload({
+        summary: "The test does not reproduce the report: the boundary is handled on this path.",
+        verification: { command: "npm test", exit_code: 1, passed: false },
+        caveats: ["The suite was already failing on two unrelated cases before I started."],
+      }),
+    });
+
+    const run = await runRunner(fixture, REPRO);
+    assert.equal(run.code, 0, run.stderr);
+
+    // The honest could-not-reproduce path the prompt asks for: `passed` false against a command that
+    // did fail, for some other reason. Reporting that as a passing test would contradict the exit
+    // code three lines below it and send the reader to rewrite a test that never ran.
+    assert.match(run.stdout, /## Repro — the failure is not the one this Task Kind needs/);
+    assert.doesNotMatch(run.stdout, /the command passed/);
+    assert.match(run.stdout, /may be erroring on its own/);
+    // The prohibition is the same either way: whatever went wrong, it is the test that gets fixed.
+    assert.match(run.stdout, /The repair is the test, never the code/);
   });
 
   it("runs against the uncommitted code the bug is usually in", async (t) => {
@@ -149,6 +173,28 @@ describe("the Migration Delegation", () => {
     // ADR-0003's sampling half, which is what makes a diff of this shape readable at all.
     assert.match(run.stdout, /read a sample of it/);
     assert.match(run.stdout, /never on its own licenses a Landing/);
+  });
+
+  it("does not invert its signal because a Worker filled in Repro's field", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    fixture.configureFake({
+      writeFiles: { "src/a.ts": "export const a = 1;\n" },
+      payload: verifiablePayload({
+        files_changed: ["src/a.ts"],
+        verification: { command: "npm run build", exit_code: 1, passed: false },
+        expected_failure: true,
+      }),
+    });
+
+    const run = await runRunner(fixture, MIGRATE);
+    assert.equal(run.code, 0, run.stderr);
+
+    // The inversion belongs to the Task Kind, not to the payload. Read from the field, a Migration
+    // whose build failed would be headlined as a success — C1's mistake in the other direction.
+    assert.match(run.stdout, /## Migration — verification did not pass/);
+    assert.doesNotMatch(run.stdout, /the test is wrong/);
+    assert.doesNotMatch(run.stdout, /inverted/);
+    assert.match(run.stderr, /expected_failure is true on a migration/);
   });
 
   it("is held to the Verifiable schema in a workspace-write Workspace, like every Verifiable Kind", async (t) => {

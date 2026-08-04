@@ -125,6 +125,16 @@ const REASONING_EFFORT = {
   migration: "low",
 };
 
+/**
+ * The Task Kinds whose Verification Signal is inverted, so that the command *failing* is the
+ * success condition (C1). A property of the Task Kind, exactly as the Class and the effort are:
+ * a Worker reports it in `expected_failure` too, but what the Runner renders cannot depend on the
+ * Worker having remembered to — a Repro whose passing test was headlined as a success is the
+ * misreading the inversion exists to prevent, and a Migration whose failed build was headlined as
+ * one would be the same mistake in the other direction.
+ */
+const INVERTED_SIGNAL = new Set(["repro"]);
+
 /** The token a prompt template carries where the Orchestrator's own request goes. */
 const REQUEST_PLACEHOLDER = "{{REQUEST}}";
 
@@ -1325,13 +1335,13 @@ function verifiableProblems(payload, { kind, observed, branch }) {
   if (!(payload.expected_failure == null || typeof payload.expected_failure === "boolean")) {
     noted.push("expected_failure is not a boolean or null");
   }
-  // C1: the field is Repro's and only Repro's. Noted rather than fatal — the rendering derives the
+  // C1: the field is Repro's and only Repro's. Noted rather than fatal — the rendering reads the
   // inversion from the Task Kind either way, so a Worker that filled this in wrongly costs a line
   // and not the Result.
-  if (kind === "repro" && payload.expected_failure !== true) {
-    noted.push("expected_failure is not true on a Repro, whose Verification Signal is inverted");
+  if (INVERTED_SIGNAL.has(kind) && payload.expected_failure !== true) {
+    noted.push(`expected_failure is not true on a ${kind}, whose Verification Signal is inverted`);
   }
-  if (kind !== "repro" && payload.expected_failure === true) {
+  if (!INVERTED_SIGNAL.has(kind) && payload.expected_failure === true) {
     noted.push(`expected_failure is true on a ${kind}, and the inverted signal belongs to Repro`);
   }
 
@@ -1384,32 +1394,41 @@ function renderVerifiable({
 }) {
   const verification = payload.verification ?? {};
   const passed = verification.passed === true;
-  // Whether the command failing is this Delegation's success condition (C1). Read from the Task Kind
-  // as well as from the Worker's own field: the inversion is a property of Repro, and a Worker that
-  // forgot to set `expected_failure` would otherwise have its passing test headlined as a success —
-  // which is the exact misreading the inversion exists to prevent.
-  const inverted = kind === "repro" || payload.expected_failure === true;
+  const inverted = INVERTED_SIGNAL.has(kind);
+  // Whether the command itself succeeded, which is a different question from whether the signal is
+  // the one the task needed — and under an inverted signal they are opposites. A Worker that could
+  // not reproduce reports `passed` false against a command that failed for some other reason, and
+  // describing that as a passing test would send the reader to rewrite a test that never ran.
+  const commandPassed = verification.exit_code === 0;
 
   const headline = passed
     ? inverted
       ? "verification failed, as this Task Kind requires"
       : "verification passed"
     : inverted
-      ? "the command passed, so the test is wrong"
+      ? commandPassed
+        ? "the command passed, so the test is wrong"
+        : "the failure is not the one this Task Kind needs"
       : "verification did not pass";
   const out = [`## ${kind[0].toUpperCase()}${kind.slice(1)} — ${headline}`];
 
   if (inverted && !passed) {
-    // C1 on the surface the Orchestrator actually reads. A Repro whose test passes has produced a
-    // test of the behaviour the code already has, and the one repair that is never correct here is
-    // changing the code — an Orchestrator reading "did not pass" as an ordinary red build would
-    // reach for exactly that.
+    // C1 on the surface the Orchestrator actually reads. A Repro that did not produce the failure it
+    // needed is one edit away from being destroyed, because the one repair that is never correct
+    // here is changing the code — and an Orchestrator reading "did not pass" as an ordinary red
+    // build reaches for exactly that.
     out.push(
       "",
-      "**The test does not fail, so it does not capture the bug.** A Repro's signal is inverted: the" +
-        " test is correct precisely when it fails. A passing test means the test is wrong and must be" +
-        " fixed — never that the code needs changing. Do not change the code to make it fail, and do" +
-        " not read this as the bug being absent or already fixed.",
+      commandPassed
+        ? "**The test does not fail, so it does not capture the bug.** A Repro's signal is inverted:" +
+            " the test is correct precisely when it fails. A passing test means the test is wrong and" +
+            " must be fixed — never that the code needs changing. Do not change the code to make it" +
+            " fail, and do not read this as the bug being absent or already fixed."
+        : "**The Worker reports this is not the failure this task needs.** The test does not fail for" +
+            " the reason the report describes: it may be erroring on its own, the suite may already" +
+            " have been red, or the bug may not reproduce at all — the caveats say which. The repair" +
+            " is the test, never the code. Do not change the code to make it fail, and do not read" +
+            " this as the bug being absent or already fixed.",
     );
   }
 
