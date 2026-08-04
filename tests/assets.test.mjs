@@ -1,12 +1,14 @@
 // Seam 2 — the asset lint. The shipped markdown and JSON never pass through the Runner, so
 // nothing else notices when they break. This lint grows one assertion per shipped asset; today
-// the plugin ships a manifest, two output schemas, six Forwarders, five commands and six prompt
-// templates.
+// the plugin ships a manifest, two output schemas, six Forwarders, six commands, one hook
+// declaration and six prompt templates.
 //
-// One assertion here is not bookkeeping: C1, that Repro's prompt template states its inverted
-// verification semantics. A Worker following the general instruction to iterate until the build is
+// Two assertions here are not bookkeeping. C1, that Repro's prompt template states its inverted
+// verification semantics: a Worker following the general instruction to iterate until the build is
 // green will "fix" the failing test and destroy the task, so those sentences are the task, and this
-// is what stops them being tidied away by someone shortening a prompt.
+// is what stops them being tidied away by someone shortening a prompt. And D15, that no `Stop` hook
+// is declared: what it lints is the *absence* of an asset, which is the one thing no other test in
+// this repository can notice going missing.
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -380,6 +382,68 @@ describe("/delegate:quota", () => {
     assert.match(body, /negotiable by the user/i);
     assert.match(body, /do not raise the ceiling/i);
     assert.match(body, /do not suggest working around the Budget/i);
+  });
+});
+
+describe("/delegate:clean", () => {
+  const { frontmatter, body } = readAsset("commands", "clean.md");
+
+  it("is the user's command, not the model's", () => {
+    // It is the one thing that collects unlanded work, and unlanded work is the user's (D22). An
+    // Orchestrator that could invoke it could delete a Worker's diff it would rather not explain.
+    assert.equal(frontmatter["disable-model-invocation"], "true");
+    assert.match(body, /runner\.mjs" clean/);
+    assert.match(body, /do not run this for them/i);
+  });
+
+  it("says what collecting destroys and what survives it", () => {
+    assert.match(body, /gone/i);
+    assert.match(body, /\/delegate:result/);
+  });
+});
+
+describe("the hooks", () => {
+  /** Every hook declaration the plugin ships, by the file it is declared in. */
+  const declarations = assetFiles
+    .filter((file) => file.endsWith(".json"))
+    .map((file) => [file, JSON.parse(readFileSync(file, "utf8")).hooks])
+    .filter(([, hooks]) => hooks !== undefined);
+
+  it("declare their hooks inline, where this file can read them", () => {
+    // A manifest may point `hooks` at another file by path instead of declaring the object. Nothing
+    // is wrong with that — but the lint below asserts an *absence*, and a declaration it silently
+    // skipped would pass while a `Stop` hook shipped in the file it pointed at.
+    for (const [file, hooks] of declarations) {
+      assert.ok(
+        hooks !== null && typeof hooks === "object" && !Array.isArray(hooks),
+        `${path.relative(REPO_ROOT, file)} declares hooks as ${JSON.stringify(hooks)}, which this` +
+          " lint cannot look inside — declare them inline, or teach it to follow the path",
+      );
+    }
+  });
+
+  it("run the narrow session-end collection of D22, and nothing else at session end", () => {
+    const commands = declarations.flatMap(([, hooks]) =>
+      (hooks.SessionEnd ?? []).flatMap((matcher) =>
+        (matcher.hooks ?? []).map((hook) => hook.command),
+      ),
+    );
+    assert.equal(commands.length, 1, commands.join(", "));
+    assert.match(commands[0], /runner\.mjs" sweep/);
+  });
+
+  it("declare no `Stop` hook, not even a disabled one", () => {
+    // D15. Full autonomy already covers what a stop-time review gate would do, and the gate would
+    // compete with the Delegation Budget for the same window — a review at every stop is spent
+    // Budget the Orchestrator never asked for. A disabled one is not a compromise: it is the same
+    // decision made in a file the user is invited to flip.
+    for (const [file, hooks] of declarations) {
+      assert.ok(
+        hooks !== null && typeof hooks === "object" && !Object.hasOwn(hooks, "Stop"),
+        `${path.relative(REPO_ROOT, file)} declares a Stop hook`,
+      );
+    }
+    assert.ok(declarations.length > 0, "no hook declaration was found to check at all");
   });
 });
 

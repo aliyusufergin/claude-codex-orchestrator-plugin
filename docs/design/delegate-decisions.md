@@ -262,6 +262,37 @@ finished-and-Landed or untouched. A running Worker is left alone: its Budget is 
 its Result is retrievable next session via `/delegate:result`. Unlanded branches are the user's
 work, not the plugin's litter.
 
+*Implemented on #12*, as `runner.mjs sweep` behind the `SessionEnd` hook and `runner.mjs clean`
+behind `/delegate:clean`. Both survey the same thing and differ only in what they ask of it, which
+is what keeps the narrow rule and the user's override from drifting into two different ideas of what
+a Workspace is.
+
+*Five states, and one table that says who collects each.* `running` is left alone by everything,
+including `/delegate:clean` — its Worker is writing into that Workspace right now, and removing it
+would not be a collection but a failed Delegation. `landed` is collected at session end because the
+diff is already in the user's tree and the Workspace is a second copy of it, which the `landed`
+record #10 put on the Result answers without a guess. `untouched` is collected there too, because it
+is a worktree and a branch with nothing in them. `unlanded` survives the session and goes only when
+the user asks. And `unmeasurable` — a Workspace whose contents cannot be read at all — is kept by the
+sweep, on the same reasoning the Runner's own disposal uses (removing a Workspace on a failure to
+look inside it is the one mistake here that destroys work) and collected on request, because the user
+asking is the authority the measurement could not supply. Without that second half a Workspace
+nothing can measure would be uncollectable by anything this plugin ships, forever.
+
+*The Workspace that needs collecting is the one whose Runner never got to clean up.* A Delegation
+that ends normally disposes of an empty Workspace itself, so what survives to session end untouched
+is almost always a Runner killed outright — which never persisted a Result either. That is what the
+`started` record in the Ledger now carries a `seed_commit` for: without the commit its Workspace was
+seeded at, "nothing was ever written into it" and "half a change is in it" are the same
+unmeasurable Workspace, and both would be kept forever. Which repository the Workspace belongs to is
+not recorded anywhere and does not need to be — the worktree points at its own repository, and that
+is read from the Workspace itself rather than from anything a dead session wrote down.
+
+*A collection is not a Landing in reverse.* Nothing it does reaches the user's working tree: what
+Landed stays Landed, and what did not is gone with the branch it lived on. `/delegate:clean` says so
+in as many words, because it is the one command in this plugin that destroys a Worker's output —
+the Result survives with its summary and its Verification Signal, and the diff does not.
+
 **D23 — Detect an outer sandbox; keep Codex's own on where the preconditions allow.** → ADR-0004
 *(Originally "disable Codex's own when one is present". Reversed 2026-08-03 — see C5.)*
 
@@ -353,9 +384,20 @@ paragraph)
 ## Harness surface
 
 **D15 — Two hooks, no `Stop` gate.** `SessionStart` checks readiness (binary present, logged in,
-Budget state). `SessionEnd` performs the narrow cleanup of D22. A `Stop` review gate is *not*
+Budget state). `SessionEnd` performs the narrow collection of D22. A `Stop` review gate is *not*
 shipped, even disabled: full autonomy already covers it, and it would compete with the Budget for
 the same window.
+
+*`SessionEnd` ships on #12*, as `runner.mjs sweep` in `hooks/hooks.json`; `SessionStart` waits for
+#13, which is where readiness is decided. The absence of the `Stop` gate is asserted rather than
+merely intended: the asset lint reads every hook declaration the plugin ships and fails on a `Stop`
+key in any of them. That is the one lint in this repository whose subject is a file that is *not*
+there, which is exactly the kind of decision that erodes silently — a disabled `Stop` hook is not a
+compromise between the two positions, it is this one made in a file the user is invited to flip.
+
+*The sweep never fails the session.* A wrong invocation is a usage error like any other, but a
+Workspace it could not remove is reported on stderr and exits `0`. A session ending is not a moment
+to hand the user an error about bookkeeping they did not ask for and cannot act on.
 
 **Command surface** *(derived from the decisions, not separately decided)*:
 
@@ -370,8 +412,9 @@ the same window.
 | `/delegate:clean` | Collect unlanded Workspaces and branches |
 
 Shipped so far: `/delegate:result` and `/delegate:quota` (#5, #7), `/delegate:status` and
-`/delegate:cancel` (#9), `/delegate:apply` (#10). All five are `disable-model-invocation` — they are
-the user's commands, and the Orchestrator reaches a Delegation through a Forwarder or not at all.
+`/delegate:cancel` (#9), `/delegate:apply` (#10), `/delegate:clean` (#12). All six are
+`disable-model-invocation` — they are the user's commands, and the Orchestrator reaches a Delegation
+through a Forwarder or not at all.
 
 *The Landing itself is not a command*, and that asymmetry is deliberate. `runner.mjs land <id>` is
 the Orchestrator's own step, taken once it has read the diff and subject to the two refusals it

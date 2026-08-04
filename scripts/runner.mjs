@@ -16,7 +16,10 @@
 // reconciliation of what the Worker claimed to have changed against what the Workspace actually
 // holds, and the running-Delegation record that `status` lists and `cancel` stops. Landing is here
 // too, and with it the mechanical half of ADR-0003: `land` refuses a Stale Workspace and a diff too
-// large to be worth reading, and `/delegate:apply` is the user's way past both.
+// large to be worth reading, and `/delegate:apply` is the user's way past both. What outlives a
+// session is here as well: `sweep` is the `SessionEnd` hook's narrow collection of D22 — Landed and
+// untouched Workspaces, nothing else — and `clean` is `/delegate:clean`, the user asking for the
+// unlanded ones to go too.
 //
 // Environment variables the Runner reads for itself. None reaches the Worker unless the user
 // puts it on the allowlist by name. The four numbers the plugin enforces have their own
@@ -61,8 +64,11 @@ import {
   createWorkspace,
   removeWorkspace,
   workspaceBase,
+  workspaceBranch,
   workspaceChanges,
   workspaceDiff,
+  workspaceLocations,
+  workspaceRepo,
 } from "./workspace.mjs";
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -78,6 +84,8 @@ const USAGE = `usage: runner.mjs delegate --kind <kind> --prompt <text|-> [--cwd
        runner.mjs cancel <id>
        runner.mjs result <id>
        runner.mjs land <id> [--manual]
+       runner.mjs sweep
+       runner.mjs clean
        runner.mjs quota [<new-ceiling>]`;
 
 /**
@@ -1014,6 +1022,15 @@ const budgetLimits = (settings) => ({
   windowHours: settings.budget_window_hours,
 });
 
+/**
+ * Refuse anything passed to a subcommand that takes nothing. An empty argument is no argument: a
+ * command invoked with nothing after it reaches the Runner as one empty string.
+ */
+function takesNoArguments(args) {
+  const [unexpected] = args.filter((arg) => arg.trim() !== "");
+  if (unexpected) throw usageError(`unexpected argument: ${unexpected}`);
+}
+
 /** Anything the Runner has to say for itself, on the channel that is diagnostic by contract. */
 function warn(message) {
   process.stderr.write(`${message}\n`);
@@ -1677,6 +1694,29 @@ async function delegate(args) {
     };
   }
 
+  // What the user has to be able to address this Delegation by while it runs, and the two signals
+  // that let them stop it. A Verifiable Delegation runs for minutes and the Forwarder that started
+  // it is not waiting (D12), so this is the only handle on it until the Result arrives.
+  //
+  // Before the Ledger record rather than after it, and that order is load-bearing: the Ledger is
+  // what makes a Workspace measurable from outside this process, and a measurable Workspace with
+  // nothing in it reads as untouched — which is a state D22 collects. Between the two writes the
+  // other way round, a collection running in another session would take a Workspace out from under
+  // a Delegation that was about to start writing into it.
+  markRunning({
+    id,
+    kind: values.kind,
+    class: delegationClass,
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    cwd,
+    repo: repo.root,
+    workspace: workspace?.path ?? null,
+    branch: workspace?.branch ?? null,
+  });
+  process.on("SIGTERM", onCancellation);
+  process.on("SIGINT", onCancellation);
+
   // The count, immediately before the spawn. At start rather than at completion, so that work
   // outliving its session still counts — and a Delegation that fails after the provider was asked
   // counts too, because the provider was asked.
@@ -1693,8 +1733,16 @@ async function delegate(args) {
       pid: process.pid,
       workspace: workspace?.path ?? null,
       branch: workspace?.branch ?? null,
+      // The commit its Workspace was seeded at, so that what the Workspace holds is measurable
+      // afterwards by something that has only the Ledger. A Runner killed outright persists no
+      // Result, and the collection of D22 has to be able to tell the Workspace it never wrote into
+      // from the one it half-filled — without this, both read as unmeasurable and are kept forever.
+      seed_commit: workspace?.seed_commit ?? null,
     });
   } catch (error) {
+    // Nothing of this Delegation is left announced: a running record naming a process that is about
+    // to exit would have `/delegate:cancel` signalling a pid the operating system reuses.
+    clearRunning(id);
     if (workspace) removeWorkspace({ repoRoot: repo.root, ...workspace });
     // The ledger is the Budget. A Budget that cannot be counted cannot be enforced, and running
     // unbounded is the one outcome ADR-0002 exists to prevent — so this refuses instead.
@@ -1703,23 +1751,6 @@ async function delegate(args) {
         " — nothing was delegated",
     );
   }
-
-  // What the user has to be able to address this Delegation by while it runs, and the two signals
-  // that let them stop it. A Verifiable Delegation runs for minutes and the Forwarder that started
-  // it is not waiting (D12), so this is the only handle on it until the Result arrives.
-  markRunning({
-    id,
-    kind: values.kind,
-    class: delegationClass,
-    pid: process.pid,
-    started_at: new Date().toISOString(),
-    cwd,
-    repo: repo.root,
-    workspace: workspace?.path ?? null,
-    branch: workspace?.branch ?? null,
-  });
-  process.on("SIGTERM", onCancellation);
-  process.on("SIGINT", onCancellation);
 
   if (workspace) {
     // The id, immediately — before the minutes of work, so that a `/delegate:status` run while this
@@ -1980,9 +2011,7 @@ const RECENT_MAX = 10;
  * nowhere else.
  */
 function status(args) {
-  if (args.filter((arg) => arg.trim() !== "").length > 0) {
-    throw usageError(`unexpected argument: ${args.find((arg) => arg.trim() !== "")}`);
-  }
+  takesNoArguments(args);
   const root = stateRoot();
   const running = runningDelegations();
   const live = new Set(running.map((entry) => entry.id));
@@ -2465,6 +2494,262 @@ function land(args) {
   process.stdout.write(renderLanding({ id, repoRoot: repo.root, workspace, diff, moved }));
 }
 
+/** One persisted Result, or `null` — a Workspace can outlive the Runner that would have written one. */
+function readResult(id) {
+  try {
+    const parsed = JSON.parse(readFileSync(resultFile(id), "utf8"));
+    return parsed !== null && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a Workspace in each state is worth collecting *by*, in one table, because "who collects
+ * what" is the whole of D22 and it is asked in two places.
+ *
+ *   - `running`      — its Delegation is still going. `never`: its Budget is spent, its Worker is
+ *                      writing into the Workspace right now, and its Result is retrievable next
+ *                      session. Removing it would not be a collection but a failed Delegation.
+ *   - `landed`       — its diff is already in the user's working tree, so the Workspace holds a
+ *                      second copy of what they have.
+ *   - `untouched`    — nothing was ever written into it. A worktree and a branch a dead Runner left
+ *                      behind, which is the plugin's litter rather than anybody's work.
+ *   - `unlanded`     — it holds a change nothing has Landed. The Worker's work, so it survives the
+ *                      session and goes only when the user asks.
+ *   - `unmeasurable` — what it holds cannot be read at all. Kept by the sweep for the reason
+ *                      `disposeIfEmpty` keeps one — removing a Workspace on a failure to look inside
+ *                      it is the one mistake here that destroys work — and collected on request,
+ *                      because the user asking is the authority the measurement could not supply,
+ *                      and a Workspace nothing can measure would otherwise be uncollectable forever.
+ */
+const COLLECTED_BY = {
+  running: "never",
+  landed: "session-end",
+  untouched: "session-end",
+  unlanded: "on-request",
+  unmeasurable: "on-request",
+};
+
+/** What `SessionEnd` collects without being asked — the narrow pair of D22, and nothing else. */
+const sweptState = (workspace) => COLLECTED_BY[workspace.state] === "session-end";
+
+/** What `/delegate:clean` collects: everything the user can be collecting when they ask. */
+const requestedState = (workspace) => COLLECTED_BY[workspace.state] !== "never";
+
+/** What is known about one Workspace on disk, in the terms `COLLECTED_BY` is keyed by. */
+function surveyWorkspace(id, dir, { running, started }) {
+  const workspace = { id, path: dir, branch: workspaceBranch(id), repoRoot: workspaceRepo(dir) };
+  const state = (name, why, extra = {}) => ({ ...workspace, state: name, why, ...extra });
+
+  if (running.has(id)) return state("running", "its Delegation is still running");
+
+  const result = readResult(id);
+  if (result?.landed) {
+    return state("landed", `its diff Landed at ${result.landed.at}, so the user's tree already holds it`);
+  }
+
+  // The Result first, the Ledger second. They agree when both are there, and only one of them is
+  // written by a Runner that was killed before it could persist anything.
+  const seed = result?.workspace?.seed_commit ?? started.get(id)?.seed_commit ?? null;
+  if (typeof seed !== "string" || seed.trim() === "") {
+    return state("unmeasurable", "the commit it was seeded at is not recorded, so what it holds cannot be measured");
+  }
+
+  let changes;
+  try {
+    changes = workspaceChanges(dir, seed);
+  } catch (error) {
+    return state("unmeasurable", `it could not be read: ${error.message}`);
+  }
+  return changes.length === 0
+    ? state("untouched", "nothing was ever written into it")
+    : state("unlanded", `it holds ${changes.length} changed file(s) that nothing has Landed`);
+}
+
+/**
+ * Every Workspace on disk, surveyed. Both locations are looked in, because which one a Workspace
+ * went to depends on a measurement taken in the session that created it.
+ *
+ * A directory whose name is not a Delegation id is not this plugin's and is not looked at, let alone
+ * removed: the Workspace base may be a directory the user pointed `$DELEGATE_STATE_DIR` at.
+ */
+function surveyWorkspaces() {
+  const root = stateRoot();
+  const running = new Set(runningDelegations().map((entry) => entry.id));
+
+  const started = new Map();
+  for (const entry of readLedger(root)) {
+    if (entry.event === "started" && entry.id) started.set(entry.id, entry);
+  }
+
+  const surveyed = [];
+  for (const base of workspaceLocations({ stateRoot: root, codexHome: codexHome() })) {
+    let entries;
+    try {
+      entries = readdirSync(base, { withFileTypes: true });
+    } catch {
+      // No Workspace was ever created here, which is the ordinary case for one of the two.
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !RESULT_ID.test(entry.name)) continue;
+      surveyed.push(surveyWorkspace(entry.name, path.join(base, entry.name), { running, started }));
+    }
+  }
+  return surveyed.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Collect the Workspaces `wanted` names, and report what happened to every one of them.
+ *
+ * The collecting is the same operation for both callers and only the question differs, so the
+ * decision is a predicate rather than a second copy of this: `sweep` asks it of what session end
+ * collects, and `clean` of everything the user can be asking about.
+ *
+ * A Workspace whose repository cannot be read is a failure rather than a skip. There is nothing this
+ * can do to it — the worktree and the branch are both git's, and git needs the repository they
+ * belong to — so it is named on the way past instead of being quietly counted as left in place.
+ */
+function collectWorkspaces(surveyed, wanted) {
+  const collected = [];
+  const failed = [];
+  const kept = [];
+
+  for (const workspace of surveyed) {
+    if (!wanted(workspace)) {
+      kept.push(workspace);
+      continue;
+    }
+    const removed =
+      workspace.repoRoot !== null &&
+      removeWorkspace({
+        repoRoot: workspace.repoRoot,
+        path: workspace.path,
+        branch: workspace.branch,
+      });
+    (removed ? collected : failed).push(workspace);
+  }
+
+  for (const workspace of failed) {
+    // On stderr: untidy rather than a failure. A collection that could not finish costs the user a
+    // directory, and neither a session ending nor a command they ran is worth failing over one.
+    warn(
+      workspace.repoRoot === null
+        ? `the Workspace ${workspace.path} could not be collected: the repository it belongs to` +
+            " could not be read, so git cannot be asked to remove either the worktree or its" +
+            ` branch — the directory is inert and \`rm -r ${workspace.path}\` is all that is left`
+        : `the Workspace ${workspace.path} could not be collected — it and branch` +
+            ` ${workspace.branch} are left behind, and \`git worktree remove\` clears them`,
+    );
+  }
+  return { collected, failed, kept };
+}
+
+/** One surveyed Workspace as a line: what it is, and why it was collected or kept. */
+const workspaceLine = (workspace) => `  ${workspace.id}  ${workspace.why}`;
+
+/**
+ * What a collection did, as the Orchestrator and the user read it. Shared by both callers so that
+ * the two of them cannot come to describe the same operation differently; what each one has to say
+ * for itself rides in `notes`.
+ */
+function renderCollection(headline, { collected, failed, kept }, notes) {
+  const out = [headline];
+  if (collected.length > 0) out.push("", "Collected", ...collected.map(workspaceLine));
+  if (kept.length + failed.length > 0) {
+    out.push("", "Left in place", ...[...kept, ...failed].map(workspaceLine));
+  }
+  for (const note of notes) out.push("", note);
+  return `${out.join("\n")}\n`;
+}
+
+/**
+ * `runner.mjs sweep` — the `SessionEnd` hook, and the whole of what this plugin collects on its own
+ * (D22).
+ *
+ * What it collects is narrow by design: a Workspace whose diff has already Landed, and one nothing
+ * was ever written into. A running Delegation is left alone with its Workspace — its Budget is spent
+ * and its Result is retrievable next session — and an unlanded Workspace is the Worker's work, not
+ * the plugin's litter, so it survives the session that made it and goes only when `/delegate:clean`
+ * asks.
+ *
+ * It never exits non-zero for anything but a wrong invocation. A session ending is not a moment to
+ * hand the user an error about bookkeeping they did not ask for and cannot act on.
+ */
+function sweep(args) {
+  takesNoArguments(args);
+
+  const surveyed = surveyWorkspaces();
+  if (surveyed.length === 0) {
+    process.stdout.write("No Workspace to collect.\n");
+    return;
+  }
+
+  const outcome = collectWorkspaces(surveyed, sweptState);
+  const left = outcome.kept.length + outcome.failed.length;
+  const notes = [];
+  if (outcome.kept.some((workspace) => COLLECTED_BY[workspace.state] === "on-request")) {
+    notes.push(
+      "What is left is not this plugin's to remove: an unlanded Workspace holds the Worker's work," +
+        " and one nothing can measure is not shown to be empty. `/delegate:clean` collects those and" +
+        " their branches when the user asks.",
+    );
+  }
+  process.stdout.write(
+    renderCollection(
+      `Collected ${outcome.collected.length} Workspace(s) at session end; ${left} left in place.`,
+      outcome,
+      notes,
+    ),
+  );
+}
+
+/**
+ * `/delegate:clean` — collect the Workspaces `SessionEnd` leaves behind, unlanded ones included.
+ *
+ * This is the user asking, and it is destructive in a way the sweep is not: an unlanded diff exists
+ * only on its Workspace's branch, and collecting the Workspace deletes that branch with it. So what
+ * went is named, and so is what survives it — the Result of every collected Delegation is still on
+ * disk, with its summary and its Verification Signal, and only the diff is gone.
+ *
+ * A running Delegation is still left alone. Its Worker is writing into that Workspace, and removing
+ * it under a live process is not a collection but a failed Delegation.
+ */
+function clean(args) {
+  takesNoArguments(args);
+
+  const surveyed = surveyWorkspaces();
+  if (surveyed.length === 0) {
+    process.stdout.write("No Workspace to collect: there is none on disk.\n");
+    return;
+  }
+
+  const outcome = collectWorkspaces(surveyed, requestedState);
+  const left = outcome.kept.length + outcome.failed.length;
+  const notes = [];
+  if (outcome.collected.length > 0) {
+    notes.push(
+      "What was in them is gone. An unlanded diff lived on its Workspace's branch and nowhere else," +
+        " and the branch went with the worktree. Each Delegation's Result is still on disk —" +
+        " `/delegate:result <id>` has the summary and the Verification Signal, not the diff.",
+    );
+  }
+  if (outcome.kept.some((workspace) => workspace.state === "running")) {
+    notes.push(
+      "A running Delegation keeps its Workspace: its Worker is writing into it. `/delegate:cancel" +
+        " <id>` stops one, and the next collection takes what it leaves.",
+    );
+  }
+  process.stdout.write(
+    renderCollection(
+      `Collected ${outcome.collected.length} Workspace(s) and their branches; ${left} left in place.`,
+      outcome,
+      notes,
+    ),
+  );
+}
+
 async function main() {
   const [subcommand, ...rest] = process.argv.slice(2);
 
@@ -2479,6 +2764,10 @@ async function main() {
       return result(rest);
     case "land":
       return land(rest);
+    case "sweep":
+      return sweep(rest);
+    case "clean":
+      return clean(rest);
     case "quota":
       return quota(rest);
     case undefined:
