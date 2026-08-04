@@ -62,6 +62,8 @@ import { SETTINGS, readSettings, writeSetting } from "./config.mjs";
 import {
   applyPatch,
   createWorkspace,
+  delegateBranches,
+  removeStrayBranch,
   removeWorkspace,
   workspaceBase,
   workspaceBranch,
@@ -2568,11 +2570,54 @@ function surveyWorkspace(id, dir, { running, started }) {
 }
 
 /**
- * Every Workspace on disk, surveyed. Both locations are looked in, because which one a Workspace
- * went to depends on a measurement taken in the session that created it.
+ * What is known about a Workspace's branch when the Workspace itself is not there — the state
+ * directory has nothing left to enumerate it from, and the repository still has the branch.
  *
- * A directory whose name is not a Delegation id is not this plugin's and is not looked at, let alone
- * removed: the Workspace base may be a directory the user pointed `$DELEGATE_STATE_DIR` at.
+ * Whatever the Worker wrote is already gone with the directory: the prompt asks it to leave its
+ * change in the working tree, so a branch at exactly the commit its Workspace was seeded at holds
+ * nothing but a snapshot of the user's own tree and is litter like an untouched Workspace. A branch
+ * that has moved past its seed holds commits the Worker made, which is work, and it survives until
+ * the user asks for it.
+ */
+function surveyStrayBranch(id, { branch, tip }, { repoRoot, running, started }) {
+  const stray = { id, path: null, branch, repoRoot };
+  const state = (name, why) => ({ ...stray, state: name, why });
+
+  // A Delegation whose Workspace has been deleted out from under a live Worker is not something to
+  // tidy up mid-run: the run is already failing, and the branch is the only place its work can land.
+  if (running.has(id)) return state("running", "its Delegation is still running");
+
+  const result = readResult(id);
+  if (result?.landed) {
+    return state("landed", `its diff Landed at ${result.landed.at}, and only the branch is left`);
+  }
+
+  const seed = result?.workspace?.seed_commit ?? started.get(id)?.seed_commit ?? null;
+  if (typeof seed !== "string" || seed.trim() === "") {
+    return state(
+      "unmeasurable",
+      "its Workspace is gone and the commit it was seeded at is not recorded, so what the branch" +
+        " holds cannot be measured",
+    );
+  }
+  return tip === seed
+    ? state("untouched", "its Workspace is gone and the branch holds nothing the Worker committed")
+    : state("unlanded", "its Workspace is gone and the branch holds commits the Worker made");
+}
+
+/**
+ * Every Workspace on disk and every branch left without one, surveyed together.
+ *
+ * Both Workspace locations are looked in, because which one a Workspace went to depends on a
+ * measurement taken in the session that created it. A directory whose name is not a Delegation id is
+ * not this plugin's and is not looked at, let alone removed: the Workspace base may be a directory
+ * the user pointed `$DELEGATE_STATE_DIR` at, and the same goes for a `delegate/…` branch whose name
+ * is not one either.
+ *
+ * The branches are the repository's answer rather than the state directory's, so they can only be
+ * asked about where the invocation is — one repository, the one the user is in. A Workspace in
+ * another repository is still surveyed from disk; a stray branch in one is not visible from here at
+ * all, and the next collection run in that repository is what finds it.
  */
 function surveyWorkspaces() {
   const root = stateRoot();
@@ -2584,6 +2629,7 @@ function surveyWorkspaces() {
   }
 
   const surveyed = [];
+  const seen = new Set();
   for (const base of workspaceLocations({ stateRoot: root, codexHome: codexHome() })) {
     let entries;
     try {
@@ -2594,9 +2640,19 @@ function surveyWorkspaces() {
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || !RESULT_ID.test(entry.name)) continue;
+      seen.add(entry.name);
       surveyed.push(surveyWorkspace(entry.name, path.join(base, entry.name), { running, started }));
     }
   }
+
+  const repoRoot = repoIdentity(process.cwd()).root;
+  for (const ref of delegateBranches(repoRoot)) {
+    const id = ref.branch.slice("delegate/".length);
+    // A branch whose Workspace is still on disk was surveyed above, as the Workspace it belongs to.
+    if (seen.has(id) || !RESULT_ID.test(id)) continue;
+    surveyed.push(surveyStrayBranch(id, ref, { repoRoot, running, started }));
+  }
+
   return surveyed.sort((a, b) => a.id.localeCompare(b.id));
 }
 
@@ -2621,29 +2677,61 @@ function collectWorkspaces(surveyed, wanted) {
       kept.push(workspace);
       continue;
     }
-    const removed =
-      workspace.repoRoot !== null &&
-      removeWorkspace({
-        repoRoot: workspace.repoRoot,
-        path: workspace.path,
-        branch: workspace.branch,
-      });
-    (removed ? collected : failed).push(workspace);
+    (collect(workspace) ? collected : failed).push(workspace);
   }
 
   for (const workspace of failed) {
     // On stderr: untidy rather than a failure. A collection that could not finish costs the user a
-    // directory, and neither a session ending nor a command they ran is worth failing over one.
-    warn(
-      workspace.repoRoot === null
-        ? `the Workspace ${workspace.path} could not be collected: the repository it belongs to` +
-            " could not be read, so git cannot be asked to remove either the worktree or its" +
-            ` branch — the directory is inert and \`rm -r ${workspace.path}\` is all that is left`
-        : `the Workspace ${workspace.path} could not be collected — it and branch` +
-            ` ${workspace.branch} are left behind, and \`git worktree remove\` clears them`,
-    );
+    // directory or a branch, and neither a session ending nor a command they ran is worth failing
+    // over one.
+    warn(uncollected(workspace));
   }
   return { collected, failed, kept };
+}
+
+/**
+ * Remove one surveyed thing, whichever of the two it is. A Workspace is a worktree and a branch; a
+ * stray is the branch on its own, left by a directory somebody deleted by hand.
+ */
+function collect(workspace) {
+  if (workspace.repoRoot === null) return false;
+  if (workspace.path === null) {
+    return removeStrayBranch({
+      repoRoot: workspace.repoRoot,
+      branch: workspace.branch,
+      // Which missing worktrees are this plugin's, for the one case that needs git's bookkeeping
+      // pruned before the branch will go.
+      bases: workspaceLocations({ stateRoot: stateRoot(), codexHome: codexHome() }),
+    });
+  }
+  return removeWorkspace({
+    repoRoot: workspace.repoRoot,
+    path: workspace.path,
+    branch: workspace.branch,
+  });
+}
+
+/** Why one thing is still there, in terms of what the user can do about it. */
+function uncollected(workspace) {
+  if (workspace.repoRoot === null) {
+    return (
+      `the Workspace ${workspace.path} could not be collected: the repository it belongs to could` +
+      " not be read, so git cannot be asked to remove either the worktree or its branch — the" +
+      ` directory is inert and \`rm -r ${workspace.path}\` is all that is left`
+    );
+  }
+  if (workspace.path === null) {
+    return (
+      `branch ${workspace.branch} could not be collected — its Workspace directory is gone and git` +
+      " still holds the worktree record that keeps the branch checked out. `git worktree prune`" +
+      " clears that, and it is left alone here because it would clear every other missing" +
+      " worktree's record in this repository too"
+    );
+  }
+  return (
+    `the Workspace ${workspace.path} could not be collected — it and branch ${workspace.branch}` +
+    " are left behind, and `git worktree remove` clears them"
+  );
 }
 
 /** One surveyed Workspace as a line: what it is, and why it was collected or kept. */

@@ -288,6 +288,22 @@ unmeasurable Workspace, and both would be kept forever. Which repository the Wor
 not recorded anywhere and does not need to be — the worktree points at its own repository, and that
 is read from the Workspace itself rather than from anything a dead session wrote down.
 
+*A Workspace is a worktree and a branch, and the two are separable.* A user who does not know the
+plugin made that directory deletes it, and the branch is then invisible from the state directory —
+nothing enumerates it, and no collection would ever have taken it. So the repository is asked as well
+as the state directory, and a `delegate/…` branch with no Workspace left is surveyed into the same
+five states: whatever the Worker wrote went with the directory, because the prompt asks it to leave
+its change in the working tree, so a branch still at the commit its Workspace was seeded at holds
+nothing but a snapshot of the user's own tree and is collected like an untouched Workspace, while one
+that has moved past its seed holds commits the Worker made and waits for the user. A branch under
+`delegate/` whose name is not a Delegation id is not this plugin's and is not touched.
+
+*That is the one place `git worktree prune` is allowed to run*, and only after looking. git will not
+delete a branch it still believes is checked out, and it goes on believing that until the record for
+the missing directory is pruned — but `prune` is repo-wide and would also drop the record of the
+user's own worktree on a volume that happens to be unmounted. So it runs only when every missing
+worktree in the repository is one of ours, and otherwise the branch is left with the reason stated.
+
 *A collection is not a Landing in reverse.* Nothing it does reaches the user's working tree: what
 Landed stays Landed, and what did not is gone with the branch it lived on. `/delegate:clean` says so
 in as many words, because it is the one command in this plugin that destroys a Worker's output —
