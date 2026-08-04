@@ -220,6 +220,64 @@ export function workspaceChanges(dir, sinceCommit) {
 }
 
 /**
+ * The whole of what a Workspace holds against its seed, as one patch plus the size of it — the two
+ * things a Landing needs (D21). The size is the Runner's own measurement rather than the Worker's
+ * `diff_stat` claim, because it is what the threshold is enforced against and what the Ledger
+ * records for O3's calibration.
+ *
+ * Committed and uncommitted alike, untracked files included, for the reason `workspaceChanges` gives:
+ * the prompt asks the Worker to leave its change in the working tree and a Worker that commits anyway
+ * has still done the work. Getting the untracked half into a diff at all means staging it, which is
+ * the one write this makes — to the Workspace's own index, never to the user's, and it changes no
+ * content on either side.
+ *
+ * A binary file has no line count, so it is counted as a file and as no lines. Reporting it is the
+ * caller's job: a Landing whose size reads as small because half of it is images is exactly the case
+ * the threshold exists to catch.
+ */
+export function workspaceDiff(dir, sinceCommit) {
+  git(dir, ["add", "-A"]);
+
+  // `--no-renames` keeps every record one path, which is what both halves of this want: a rename is
+  // a deletion and an addition to a patch and to a line count alike.
+  const files = [];
+  let lines = 0;
+  let binary = 0;
+  for (const record of zSplit(
+    git(dir, ["diff", "--cached", "--numstat", "-z", "--no-renames", sinceCommit]),
+  )) {
+    const [added, deleted, file] = record.split("\t");
+    if (file === undefined) continue;
+    files.push(file);
+    // `-` in either column is git saying the file is binary, not zero lines changed.
+    if (added === "-" || deleted === "-") binary += 1;
+    else lines += Number(added) + Number(deleted);
+  }
+
+  return {
+    patch: git(dir, ["diff", "--cached", "--binary", "--no-renames", sinceCommit]),
+    files: files.sort(),
+    lines,
+    binary,
+  };
+}
+
+/**
+ * Apply a Workspace's patch to the user's working tree — the one moment in this plugin that writes
+ * there at all, and the reason every other path in this module is read-only on the user's side.
+ *
+ * Working tree only: no `--index`, so nothing is staged and nothing is committed. What Lands arrives
+ * as the user's own uncommitted change, which is the state they can read with `git diff` and undo
+ * without consulting the plugin.
+ *
+ * `git apply` is all-or-nothing without `--reject`, so a patch that no longer fits leaves the tree
+ * exactly as it was and the caller reports a failure rather than a half-Landing.
+ */
+export function applyPatch({ repoRoot, patch }) {
+  git(repoRoot, ["apply", "--binary", "--whitespace=nowarn", "-"], { input: patch });
+}
+
+/**
  * Remove a Workspace and its branch. Only ever called for a Workspace with nothing in it: a Worker's
  * unlanded work is the user's, not the plugin's litter to sweep (D22). Best-effort — a Workspace
  * that cannot be removed is untidy, and failing a Delegation over it would be worse.

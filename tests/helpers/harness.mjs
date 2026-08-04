@@ -218,6 +218,20 @@ export function runRunner(fixture, args, options = {}) {
   });
 }
 
+/**
+ * Wait for the Runner to announce a live Delegation, so a test can act while one runs — the only
+ * way to reach the window a Verifiable Delegation spends working, which is where a user's own edit
+ * makes its Workspace Stale.
+ */
+export async function whileRunning(fixture, act) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const [entry] = fixture.running();
+    if (entry) return act(entry);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("no Delegation was ever recorded as running");
+}
+
 /** One schema-conforming Advisory finding, with the fields a test cares about overridden. */
 export function advisoryFinding(overrides = {}) {
   return {
