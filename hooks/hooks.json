@@ -1,0 +1,16 @@
+{
+  "description": "SessionEnd collects the Workspaces the plugin left behind — the Landed and the untouched, nothing else. A running Delegation and an unlanded branch both survive the session. No Stop hook ships, not even disabled: full autonomy already covers it, and a stop-time review gate would compete with the Delegation Budget for the same window.",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/runner.mjs\" sweep",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

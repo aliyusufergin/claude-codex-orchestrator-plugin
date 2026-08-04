@@ -22,6 +22,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   readlinkSync,
@@ -30,8 +31,13 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-/** The branch every Workspace is on, named after the Delegation so the two are traceable to each other. */
-const branchFor = (id) => `delegate/${id}`;
+/**
+ * The branch every Workspace is on, named after the Delegation so the two are traceable to each
+ * other. Exported because a Workspace outlives the session that made it: what collects one later
+ * knows the Delegation's id and nothing else, and deriving the branch a second way would be a
+ * second place for the naming to drift.
+ */
+export const workspaceBranch = (id) => `delegate/${id}`;
 
 /**
  * The identity the seed commit is made under. A Workspace is not the user's history, and a seed
@@ -90,6 +96,21 @@ export function isInside(target, parent) {
   return child === root || child.startsWith(root + path.sep);
 }
 
+/** Where Workspaces go when the state directory is somewhere Codex's sandbox helper cannot mount over. */
+const preferredBase = (stateRoot) => path.join(stateRoot, "workspaces");
+
+/** Where they go when it is not — `$CODEX_HOME`, the one directory a Delegation has already needed. */
+const fallbackBase = (codexHome) => path.join(codexHome, "delegate", "workspaces");
+
+/**
+ * Every directory a Workspace may be sitting in. Which of the two was chosen is the outcome of a
+ * measurement taken in the session that created it, so anything collecting Workspaces afterwards
+ * looks in both rather than re-taking a measurement of a machine that may have changed.
+ */
+export function workspaceLocations({ stateRoot, codexHome }) {
+  return [...new Set([preferredBase(stateRoot), fallbackBase(codexHome)])];
+}
+
 /**
  * Where Workspaces are kept: beside the rest of the plugin's state, unless that is somewhere Codex's
  * sandbox helper may mount over (C6). `$CODEX_HOME` is the fallback, because a Delegation has
@@ -102,11 +123,11 @@ export function isInside(target, parent) {
 export function workspaceBase({ stateRoot, codexHome, forbidden }) {
   const shadowed = (dir) => forbidden.find((root) => isInside(dir, root)) ?? null;
 
-  const preferred = path.join(stateRoot, "workspaces");
+  const preferred = preferredBase(stateRoot);
   const under = shadowed(preferred);
   if (under === null) return { dir: preferred, warning: null };
 
-  const fallback = path.join(codexHome, "delegate", "workspaces");
+  const fallback = fallbackBase(codexHome);
   const alsoUnder = shadowed(fallback);
   if (alsoUnder !== null) {
     throw new WorkspaceError(
@@ -165,7 +186,7 @@ function copyUntracked(repoRoot, into) {
  * when the working tree was clean.
  */
 export function createWorkspace({ repoRoot, head, base, id }) {
-  const branch = branchFor(id);
+  const branch = workspaceBranch(id);
   const dir = path.join(base, id);
 
   mkdirSync(base, { recursive: true });
@@ -278,16 +299,73 @@ export function applyPatch({ repoRoot, patch }) {
 }
 
 /**
- * Remove a Workspace and its branch. Only ever called for a Workspace with nothing in it: a Worker's
- * unlanded work is the user's, not the plugin's litter to sweep (D22). Best-effort — a Workspace
- * that cannot be removed is untidy, and failing a Delegation over it would be worse.
+ * The repository a Workspace belongs to, asked of the worktree itself.
+ *
+ * A Workspace outlives the session that created it (D22), and what collects one later may have no
+ * record of it at all — a Runner killed outright never persisted a Result naming the repository it
+ * came from. The worktree knows: its own `.git` file points at the repository's shared git
+ * directory, and the repository is what that sits in. Returns `null` when the question cannot be
+ * answered, which is a Workspace nothing can be done to rather than one that is safe to remove.
+ */
+export function workspaceRepo(dir) {
+  try {
+    const common = text(
+      git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    ).trim();
+    return common === "" ? null : path.dirname(common);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a branch is still there — asked rather than inferred from whether a delete succeeded.
+ *
+ * Only one answer means "gone": `--quiet` exiting `1` with nothing on stderr, which is git saying the
+ * ref does not resolve. Everything else — a git that could not run, a repository it could not read —
+ * is not an answer at all, and an unanswered question about a branch reads as the branch still being
+ * there. The cost of that is a collection reported as incomplete when it was not; the cost of the
+ * other direction is one reported as complete with the branch still on disk.
+ */
+function branchExists(repoRoot, branch) {
+  const run = spawnSync(
+    "git",
+    ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+    { encoding: "utf8" },
+  );
+  return !(run.status === 1 && String(run.stderr ?? "") === "");
+}
+
+/**
+ * Remove a Workspace and its branch, and report whether anything is left behind.
+ *
+ * Called for a Workspace with nothing in it, whose Delegation's work is already Landed, or at the
+ * user's own request through `/delegate:clean`. Never for one holding unlanded work of its own
+ * accord: that work is the Worker's, and D22 leaves it alone.
+ *
+ * Both steps are attempted whatever the other one did, because they fail independently: a worktree
+ * git will not remove leaves a branch it will not delete either, and saying so needs both answers.
+ * Nothing here reaches wider than this Workspace — no `prune`, which would clear the bookkeeping of
+ * every other worktree in the user's repository whose directory happens to be missing.
+ *
+ * What is returned is what is true afterwards rather than which command exited zero: a Workspace
+ * whose directory was already gone is collected, and one whose branch survived is not.
  */
 export function removeWorkspace({ repoRoot, path: dir, branch }) {
   try {
     git(repoRoot, ["worktree", "remove", "--force", dir]);
-    git(repoRoot, ["branch", "-D", branch]);
-    return true;
   } catch {
-    return false;
+    // Missing, locked, or not a worktree at all. The check below says whether it is still there.
   }
+
+  let branchGone = false;
+  try {
+    git(repoRoot, ["branch", "-D", branch]);
+    branchGone = true;
+  } catch {
+    // Already gone, or still checked out in a worktree that is still there. Asking is the only way
+    // to tell those apart, and a git that cannot answer at all reads as the branch still being here.
+    branchGone = !branchExists(repoRoot, branch);
+  }
+  return !existsSync(dir) && branchGone;
 }

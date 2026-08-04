@@ -145,3 +145,10 @@ The rule that the Orchestrator may alter the user's working tree only from conte
 read and checked against the code. It authorises the Orchestrator to act on a verified Advisory
 finding or to Land a diff it has read, and withholds that authority when reading the diff would
 cost more than the Delegation saved — at which point the decision returns to the user.
+
+**Collection**:
+Removing a Workspace and the branch it holds. What ends a session collects only the Workspaces that
+are finished-and-Landed or untouched — a running Delegation keeps its Workspace, and an unlanded
+branch is the Worker's work rather than the plugin's litter, collected only when the user asks for
+it through `/delegate:clean`. Nothing about a Collection reaches the user's working tree.
+_Avoid_: cleanup, garbage collection, pruning
