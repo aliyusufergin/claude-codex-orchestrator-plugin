@@ -275,6 +275,46 @@ command", which contradicted D13.)* → ADR-0003
 via `evidence`; confirmed, localised, test-covered ones are applied; anything unverifiable,
 broad, or touching behaviour, public API, security or architecture goes to the user. → ADR-0003
 
+**D7, D13 and D21 implemented on #10**, as `runner.mjs land <id>` — the one operation in this plugin
+that writes to the user's working tree, and everything about Read-Before-Change that can be enforced
+rather than asked for.
+
+*What is mechanical is what a process can measure.* Three things are refused to the autonomous path
+and passed by `--manual`, none of them a judgement about the change: a **Stale Workspace**, whose
+diff can no longer be checked against the tree it would land in; a diff past `diff_max_lines`, where
+reading it costs more than the Delegation saved, which is the case ADR-0003 hands back by name; and a
+diff touching a binary file, which has no lines to count and cannot be read at all — without that
+third one a Workspace of changed images measures as a nought-line diff and sails past the threshold.
+Two more are refused to *both* paths, because they are not about who decides: a Delegation that
+failed (D14 — the failure is reported and work stops, and `land` is the one place that could quietly
+become "Land it anyway"), and a payload that is not a usable Verifiable Result. The second is not
+hypothetical: a Result is persisted *before* it is checked, so a payload with no **Verification
+Signal** sits on disk beside a Workspace full of changes, and the checks are re-asked here against
+what that Workspace now holds.
+
+What cannot be measured is whether the diff was *read*, and no amount of enforcement here reaches it
+— so the threshold is the mechanical half of that rule and the prompts carry the rest, including how
+much to read: in full when small, by sampling when the change is uniform and mechanical. They carry
+it on the two surfaces the Orchestrator is actually holding when it decides, the Verifiable rendering
+and `/delegate:result`. The Advisory half of D13 rides on the Advisory rendering for the same reason.
+
+*The Landing is not a merge.* The patch is applied to the working tree and nothing else: unstaged,
+uncommitted, and undoable with `git checkout --` by a user who never learns what this plugin is.
+`git apply` is all-or-nothing without `--reject`, so a diff that no longer fits leaves the tree
+exactly as it was and the Runner reports that rather than half a Landing.
+
+*The diff is measured, not read from the Result.* `diff_stat` is the Worker's claim, and the size a
+threshold is enforced against cannot be one — so the Runner stages the Workspace's own index and
+measures `git diff --cached --numstat` against the seed commit. That measurement is taken before
+anything decides anything, including on the paths that go on to refuse, because the sizes that are
+turned away are exactly the ones O3 needs to calibrate the threshold against. It lands in the Ledger
+as a `landing` record, the third of the three observations calibration was waiting for.
+
+*A Landing is recorded on the Result.* `landed` carries when, by which path, into which repository,
+and what moved if anything had. A second Landing is refused on the strength of it — the same diff
+applied twice is not idempotent — and D22's collection has the "finished-and-Landed" half of its
+question answered without having to guess.
+
 **D24 — Where a Result is persisted** *(new on #5; not from the session)*. `$DELEGATE_STATE_DIR`, else
 `${CLAUDE_PLUGIN_DATA}`, else `$CODEX_HOME/delegate` — `results/<kind>-<8 hex>.json`, one file per
 Delegation. `${CLAUDE_PLUGIN_ROOT}` is explicitly not durable across plugin updates; `$CODEX_HOME`
@@ -292,6 +332,15 @@ living inside it.
 
 **D21 — A Stale Workspace cannot be Landed autonomously.** The Runner records the `HEAD` and a hash
 of the uncommitted state it seeded from and compares at Landing time. → ADR-0003
+
+*Both halves are compared on #10, and either one moving is enough.* They answer different questions:
+`HEAD` says the branch point moved, and the digest — #8's helper, reused rather than written a second
+time — says the uncommitted work the Workspace was seeded with is not the uncommitted work that is
+there now. A measurement that could not be taken, at seed time or at Landing time, reads as Stale
+rather than as clean: the rule is that the diff can be checked against reality, and an unmeasured
+tree cannot be shown to be the one the Worker saw. The false Stale costs a command; the false clean
+costs the user's code. The refusal names which of the two moved, leaves the branch exactly where it
+is, and points at `/delegate:apply`.
 
 **D14 — Two standing guardrails.** A failed Delegation is never substituted with the Orchestrator's
 own answer — the failure is reported and work stops. And Result text is framed as data from an
@@ -320,8 +369,13 @@ the same window.
 | `/delegate:clean` | Collect unlanded Workspaces and branches |
 
 Shipped so far: `/delegate:result` and `/delegate:quota` (#5, #7), `/delegate:status` and
-`/delegate:cancel` (#9). All four are `disable-model-invocation` — they are the user's commands, and
-the Orchestrator reaches a Delegation through a Forwarder or not at all.
+`/delegate:cancel` (#9), `/delegate:apply` (#10). All five are `disable-model-invocation` — they are
+the user's commands, and the Orchestrator reaches a Delegation through a Forwarder or not at all.
+
+*The Landing itself is not a command*, and that asymmetry is deliberate. `runner.mjs land <id>` is
+the Orchestrator's own step, taken once it has read the diff and subject to the two refusals it
+cannot talk its way past; `/delegate:apply` is the same step with `--manual`, which is the user
+overruling both. A single command reachable by either would be one or the other by accident.
 
 ---
 
@@ -503,9 +557,12 @@ Every one of them is a placeholder. The window is the shape the Worker's provide
 than a measurement of it; the ceiling is a guess at how many Delegations fit in one; the TTL is set
 by how long a working tree stays recognisable, not by data. The threshold gained its first consumer
 on #9: a Verifiable rendering whose `diff_stat` exceeds it says so, and says the decision to Land is
-the user's — the Landing itself is still #10's. `/delegate:quota` prints all four with where each came from and says they are
-provisional, and the Ledger records what closing this needs: Delegation counts per window,
-durations, and diff sizes.
+the user's. On #10 it became enforcement rather than advice — `runner.mjs land` refuses a diff past
+it and hands the decision back — measured against the Runner's own count of the diff rather than the
+Worker's claim. `/delegate:quota` prints all four with where each came from and says they are
+provisional, and the Ledger now records all three of the observations closing this needs: Delegation
+counts per window, durations, and diff sizes, the last of them measured at Landing time and recorded
+even when the Landing was refused for being too large.
 
 **O4 — `enableWeakerNestedSandbox`. Answered 2026-08-03: no.** It swaps a namespace-scoped procfs
 for a bind of the host `/proc` and drops `--cap-drop ALL` — neither is what Codex needs. Every

@@ -1,6 +1,6 @@
 // Seam 2 — the asset lint. The shipped markdown and JSON never pass through the Runner, so
 // nothing else notices when they break. This lint grows one assertion per shipped asset; today
-// the plugin ships a manifest, two output schemas, four Forwarders, four commands and four prompt
+// the plugin ships a manifest, two output schemas, four Forwarders, five commands and four prompt
 // templates.
 
 import assert from "node:assert/strict";
@@ -200,6 +200,14 @@ for (const kind of [...ADVISORY_KINDS, ...VERIFIABLE_KINDS]) {
         assert.match(body, /do not wait/i);
       });
 
+      it("says a passing Verification Signal is not permission to touch the user's files", () => {
+        // ADR-0003 on the surface the Result crosses back in on. The signal is the Worker's report
+        // on its own work — a Worker asked to make tests pass can change the tests — so a Forwarder
+        // that returned it as proof would be handing over the one claim most shaped like authority.
+        assert.match(body, /never on its own licenses/i);
+        assert.match(body, /do not Land/i);
+      });
+
       it("does not describe a Result that does not exist yet", () => {
         // The failure mode of a non-blocking Delegation: the Forwarder returns before the Worker
         // has finished, and anything it says about the change is invention.
@@ -292,6 +300,31 @@ describe("/delegate:cancel", () => {
     // D14's first guardrail, in the one case where the Delegation was stopped on purpose.
     assert.match(body, /produced no Result/i);
     assert.match(body, /do not do\s+the work yourself/i);
+  });
+});
+
+describe("/delegate:apply", () => {
+  const { frontmatter, body } = readAsset("commands", "apply.md");
+
+  it("is the user's command, not the model's", () => {
+    // It is the escape hatch from both of ADR-0003's refusals. An Orchestrator that could invoke it
+    // would be overruling the rule that governs it, one command later.
+    assert.equal(frontmatter["disable-model-invocation"], "true");
+    assert.ok(frontmatter["argument-hint"], "a command taking an id says so");
+    assert.match(body, /runner\.mjs" land/);
+    assert.match(body, /--manual/);
+  });
+
+  it("says it is the escape hatch and not the normal path", () => {
+    assert.match(body, /escape hatch, not the normal path/i);
+    assert.match(body, /Stale/);
+    assert.match(body, /do not run it for them/i);
+  });
+
+  it("says a passing Verification Signal never licenses a Landing", () => {
+    // The Landing this command performs is the one the autonomous path refused, so the reason the
+    // signal is not authority has to be here rather than only where the Result was rendered.
+    assert.match(body, /never on its own licenses a Landing/i);
   });
 });
 

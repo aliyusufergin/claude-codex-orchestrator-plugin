@@ -58,3 +58,11 @@ If the command exits non-zero, return its stderr verbatim and say the Delegation
 retry it, do not work around it, and do not write the change yourself — a failed Delegation is
 reported as a failure, never replaced with your own answer, and work stops there rather than
 continuing on a guess.
+
+The Result, when it comes, reports a test or build signal the Worker ran against its own change. That
+signal is evidence and never authority: a Worker asked to make tests pass can satisfy the instruction
+by changing the tests, so a passing signal never on its own licenses moving that change into the
+user's files. The change stays in its workspace until somebody who has read the diff Lands it, and
+Landing is the Runner's own step — refused for a workspace the user's files have moved under, and
+refused for a diff too large to be worth reading. Do not Land anything, and do not describe the
+Result as though it were already in the user's code.

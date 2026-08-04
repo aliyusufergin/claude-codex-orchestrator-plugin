@@ -17,19 +17,10 @@ import {
   resultId,
   runRunner,
   verifiablePayload,
+  whileRunning,
 } from "./helpers/harness.mjs";
 
 const IMPLEMENT = ["delegate", "--kind", "implementation", "--prompt", "make the token check inclusive"];
-
-/** Wait for the Runner to announce a live Delegation, so a test can act on it while it runs. */
-async function whileRunning(fixture, act) {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    const [entry] = fixture.running();
-    if (entry) return act(entry);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error("no Delegation was ever recorded as running");
-}
 
 describe("the Implementation Delegation", () => {
   it("is held to the Verifiable schema and starts clean", async (t) => {
@@ -85,8 +76,14 @@ describe("the Implementation Delegation", () => {
     // Nothing here is a Landing, and a passing signal is not permission to make one (ADR-0003).
     assert.match(run.stdout, /Nothing has been Landed/);
     assert.match(run.stdout, /never on its own licenses a Landing/);
-    // The one thing that makes the diff readable at all.
+    // The one thing that makes the diff readable at all, and how much of it to read: in full when
+    // small, by sampling when it is uniform and mechanical (ADR-0003). The threshold is the half of
+    // that rule a process can enforce; this is the half only the prompt surface can carry.
     assert.match(run.stdout, /git -C .* diff /);
+    assert.match(run.stdout, /in full when it is small/);
+    assert.match(run.stdout, /read a sample of it/);
+    // Where the Landing itself happens, so that it goes through the checks rather than around them.
+    assert.match(run.stdout, /runner\.mjs" land implementation-[0-9a-f]{8}/);
   });
 
   it("announces the Delegation's id before the work rather than after it", async (t) => {
