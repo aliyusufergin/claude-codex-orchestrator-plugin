@@ -43,9 +43,10 @@ off. Apache-2.0 matches `codex-plugin-cc`, whose schemas and prompt templates ma
 **D19 — All six Task Kinds ship in the first release.** Rejected: a vertical slice, or Advisory
 first. Accepted cost — six prompt templates written before real usage informs them.
 
-*Four of the six exist as of #9*: Review, Diagnosis, Adversarial and Implementation. Repro and
-Migration have a Delegation Class, a schema and a sandbox mode already; what they still need is a
-prompt template and a Forwarder each.
+*All six exist as of #11*: Review, Diagnosis and Adversarial on the Advisory side, Implementation,
+Repro and Migration on the Verifiable one. Each ships a prompt template and a Forwarder, and the
+asset lint asserts both for all six — a Task Kind with no template still runs, sending the request
+without the instructions its Class assumes.
 
 ---
 
@@ -384,6 +385,25 @@ overruling both. A single command reachable by either would be one or the other 
 **C1 — Repro's verification semantics are inverted** and must be stated in its prompt template, or
 a Worker following D6's general instruction will "fix" the failing test and destroy the task.
 *(Folded into `CONTEXT.md` and D6.)*
+
+*Implemented on #11, in three places rather than one.* The prompt template states the inversion
+before it states anything else — correct precisely when it fails, a passing test means the test is
+wrong and must be fixed, never the code, and no editing the code to manufacture a failure — and the
+asset lint asserts those sentences by name, which is the point of that lint rather than an
+afterthought. The Runner reads the inversion from the **Task Kind** and not from the Worker's
+`expected_failure`, which is a table beside the Class and the effort tables: a Repro whose Worker
+left the field null would otherwise have its passing test headlined as a success, and a Migration
+whose Worker filled it in wrongly would have its failed build headlined as one — the same misreading
+in both directions. The field is still checked and a departure reported on stderr, like every other
+departure from the Verifiable schema.
+
+*A Repro whose signal did not invert is rendered as the test being wrong*, with the prohibition on
+changing the code repeated there — the Orchestrator reading "verification did not pass" as an
+ordinary red build is the moment the task gets destroyed. Two cases, because they are not the same
+report: a command that *passed* means the test captures behaviour the code already has, while a
+command that failed for some other reason is the honest could-not-reproduce path the template asks
+for, and calling that a passing test would contradict the exit code printed three lines below it.
+The repair is the test in both.
 
 **C2 — Forwarders carry no schema, prompt, or Codex effort.** D9's original justification claimed
 they would; D16 and D20 moved all three into the Runner. Agents pass `--kind` only.
