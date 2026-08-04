@@ -10,11 +10,12 @@
 // The one thing that collects unlanded work is the user asking for it — `/delegate:clean`.
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import {
   createFixtureRepo,
+  git,
   gitStdout,
   resultId,
   runRunner,
@@ -195,6 +196,50 @@ describe("/delegate:clean", () => {
 
     await runRunner(fixture, ["cancel", runningEntry.id]);
     await inFlight;
+  });
+});
+
+describe("a branch left without its Workspace", () => {
+  /** The Workspace directory of a finished Delegation, as the user would find it to delete it. */
+  const workspaceOf = (fixture, id) => path.join(fixture.stateDir, "workspaces", id);
+
+  it("is collected at session end when the Worker committed nothing to it", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    const id = await delegated(fixture, { "a.ts": "export const a = 1;\n" });
+    // A branch of the plugin's shape that is not a Delegation id: the user's own, and not this
+    // plugin's to touch however much it looks like one.
+    await git(fixture.repo, ["branch", "delegate/not-an-id"]);
+
+    // The user deleted the worktree by hand, which is what somebody who does not know the plugin
+    // made it reaches for. Whatever the Worker wrote went with the directory — the prompt asks it to
+    // leave its change in the working tree — so the branch is at the commit it was seeded at and
+    // holds nothing but a snapshot of the user's own tree.
+    rmSync(workspaceOf(fixture, id), { recursive: true, force: true });
+
+    const swept = await runRunner(fixture, ["sweep"]);
+    assert.equal(swept.code, 0, swept.stderr);
+    assert.match(swept.stdout, new RegExp(`${id}  its Workspace is gone`));
+    assert.equal(await branches(fixture), "delegate/not-an-id", swept.stdout);
+  });
+
+  it("survives until the user asks when the Worker committed to it", async (t) => {
+    const fixture = await createFixtureRepo(t);
+    const id = await delegated(fixture, { "a.ts": "export const a = 1;\n" });
+
+    // A Worker that committed anyway has still done the work, and the branch is where it is.
+    const workspace = workspaceOf(fixture, id);
+    await git(workspace, ["add", "-A"]);
+    await git(workspace, ["commit", "-m", "the Worker committed its change"]);
+    rmSync(workspace, { recursive: true, force: true });
+
+    const swept = await runRunner(fixture, ["sweep"]);
+    assert.equal(swept.code, 0, swept.stderr);
+    assert.equal(await branches(fixture), `delegate/${id}`, swept.stdout);
+    assert.match(swept.stdout, /holds commits the Worker made/);
+
+    const cleaned = await runRunner(fixture, ["clean"]);
+    assert.equal(cleaned.code, 0, cleaned.stderr);
+    assert.equal(await branches(fixture), "", cleaned.stdout);
   });
 });
 

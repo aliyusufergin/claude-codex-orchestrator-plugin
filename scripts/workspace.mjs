@@ -336,6 +336,85 @@ function branchExists(repoRoot, branch) {
   return !(run.status === 1 && String(run.stderr ?? "") === "");
 }
 
+/** Delete one branch and report whether it is gone afterwards, however it got that way. */
+function deleteBranch(repoRoot, branch) {
+  try {
+    git(repoRoot, ["branch", "-D", branch]);
+    return true;
+  } catch {
+    // Already gone, or still checked out in a worktree that is still there. Asking is the only way
+    // to tell those apart, and a git that cannot answer at all reads as the branch still being here.
+    return !branchExists(repoRoot, branch);
+  }
+}
+
+/**
+ * Every `delegate/…` branch in a repository, with the commit it points at.
+ *
+ * This is the other half of what a Delegation leaves behind. A Workspace is a worktree *and* a
+ * branch, and deleting the directory by hand — which is what a user reaches for when they do not
+ * know the plugin made it — leaves the branch with nothing to enumerate it from the state directory.
+ * The repository is where it is still visible.
+ */
+export function delegateBranches(repoRoot) {
+  try {
+    return text(
+      git(repoRoot, [
+        "for-each-ref",
+        "--format=%(refname:short)%09%(objectname)",
+        "refs/heads/delegate/",
+      ]),
+    )
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => {
+        const [branch, tip] = line.split("\t");
+        return { branch, tip };
+      });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Delete a branch whose Workspace directory is gone, clearing the bookkeeping that stands in the
+ * way only when all of it is this plugin's.
+ *
+ * git refuses to delete a branch it still believes is checked out, and it goes on believing that
+ * until the record under `.git/worktrees` for the missing directory is pruned. `git worktree prune`
+ * is the only thing that clears it and it is repo-wide: it would also drop the record of the user's
+ * own worktree on a volume that happens to be unmounted right now. So it runs only when every
+ * missing worktree in the repository is one of ours — otherwise the branch is left, and the caller
+ * reports that rather than tidying up something it was not asked about.
+ */
+export function removeStrayBranch({ repoRoot, branch, bases }) {
+  if (deleteBranch(repoRoot, branch)) return true;
+
+  let listing;
+  try {
+    listing = text(git(repoRoot, ["worktree", "list", "--porcelain"]));
+  } catch {
+    return false;
+  }
+
+  const missing = [];
+  for (const block of listing.split("\n\n")) {
+    const dir = block.match(/^worktree (.+)$/m)?.[1];
+    if (dir === undefined || existsSync(dir)) continue;
+    missing.push({ dir, ref: block.match(/^branch (.+)$/m)?.[1] ?? "" });
+  }
+  const ours = ({ dir, ref }) =>
+    ref.startsWith("refs/heads/delegate/") || bases.some((base) => isInside(dir, base));
+  if (missing.length === 0 || !missing.every(ours)) return false;
+
+  try {
+    git(repoRoot, ["worktree", "prune"]);
+  } catch {
+    return false;
+  }
+  return deleteBranch(repoRoot, branch);
+}
+
 /**
  * Remove a Workspace and its branch, and report whether anything is left behind.
  *
@@ -347,6 +426,7 @@ function branchExists(repoRoot, branch) {
  * git will not remove leaves a branch it will not delete either, and saying so needs both answers.
  * Nothing here reaches wider than this Workspace — no `prune`, which would clear the bookkeeping of
  * every other worktree in the user's repository whose directory happens to be missing.
+ * `removeStrayBranch` is where the case that needs pruning lives, and it looks before it does it.
  *
  * What is returned is what is true afterwards rather than which command exited zero: a Workspace
  * whose directory was already gone is collected, and one whose branch survived is not.
@@ -358,14 +438,6 @@ export function removeWorkspace({ repoRoot, path: dir, branch }) {
     // Missing, locked, or not a worktree at all. The check below says whether it is still there.
   }
 
-  let branchGone = false;
-  try {
-    git(repoRoot, ["branch", "-D", branch]);
-    branchGone = true;
-  } catch {
-    // Already gone, or still checked out in a worktree that is still there. Asking is the only way
-    // to tell those apart, and a git that cannot answer at all reads as the branch still being here.
-    branchGone = !branchExists(repoRoot, branch);
-  }
+  const branchGone = deleteBranch(repoRoot, branch);
   return !existsSync(dir) && branchGone;
 }

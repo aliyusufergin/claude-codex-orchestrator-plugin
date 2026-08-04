@@ -11,6 +11,9 @@ Above is what came of collecting the Workspaces. Each one that went took its bra
 unlanded diff lived on that branch and nowhere else — so what those Workers wrote is gone. A
 Workspace whose Delegation is still running is left alone; its Worker is writing into it.
 
+A branch whose Workspace directory has already been deleted is collected here too, in this
+repository. Session end takes those only when the branch holds nothing the Worker committed.
+
 Show the user what they asked for and stop there.
 
 This is the user's command and the only thing that collects unlanded work. Session end collects far
