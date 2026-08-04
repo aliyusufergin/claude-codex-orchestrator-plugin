@@ -407,11 +407,11 @@ the same window.
 *`SessionEnd` ships on #12*, as `runner.mjs sweep` in `hooks/hooks.json`; *`SessionStart` ships on
 #13*, as `runner.mjs ready` beside it, with no matcher — a resumed or cleared session has the same
 preconditions as a fresh one, and none of them is measured until it is asked. The absence of the
-`Stop` gate is asserted rather than
-merely intended: the asset lint reads every hook declaration the plugin ships and fails on a `Stop`
-key in any of them. That is the one lint in this repository whose subject is a file that is *not*
-there, which is exactly the kind of decision that erodes silently — a disabled `Stop` hook is not a
-compromise between the two positions, it is this one made in a file the user is invited to flip.
+`Stop` gate is asserted rather than merely intended: the asset lint reads every hook declaration the
+plugin ships and fails on a `Stop` key in any of them. That is the one lint in this repository whose
+subject is a file that is *not* there, which is exactly the kind of decision that erodes silently —
+a disabled `Stop` hook is not a compromise between the two positions, it is this one made in a file
+the user is invited to flip.
 
 *The sweep never fails the session.* A wrong invocation is a usage error like any other, but a
 Workspace it could not remove is reported on stderr and exits `0`. A session ending is not a moment

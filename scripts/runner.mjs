@@ -1076,6 +1076,19 @@ function budgetRefusal(state) {
   );
 }
 
+/**
+ * The four numbers with their values and where each came from, as lines. Written once because both
+ * `/delegate:quota` and `/delegate:setup` print it, and two copies of a table read from the same
+ * source would still drift in the one way that matters — how it is laid out is what a user compares
+ * between the two commands.
+ */
+function settingsTable(values, sources) {
+  const width = Math.max(...Object.values(SETTINGS).map((spec) => spec.label.length));
+  return Object.entries(SETTINGS).map(
+    ([key, spec]) => `  ${spec.label.padEnd(width)}  ${spec.format(values[key]).padEnd(12)}  ${sources[key]}`,
+  );
+}
+
 /** The Budget as `/delegate:quota` shows it, settings and all. */
 function renderQuota({ state, values, sources, root }) {
   const out = [
@@ -1094,10 +1107,7 @@ function renderQuota({ state, values, sources, root }) {
     "The numbers in force. Every one of them is provisional — they are to be calibrated against",
     "real runs, not guessed, and the Runner's ledger records what that calibration needs:",
   );
-  const width = Math.max(...Object.values(SETTINGS).map((spec) => spec.label.length));
-  for (const [key, spec] of Object.entries(SETTINGS)) {
-    out.push(`  ${spec.label.padEnd(width)}  ${spec.format(values[key]).padEnd(12)}  ${sources[key]}`);
-  }
+  out.push(...settingsTable(values, sources));
 
   out.push(
     "",
@@ -2868,8 +2878,12 @@ const API_PORT = 443;
 /** How long that probe waits before the host counts as unreachable. `SessionStart` is blocking. */
 const API_PROBE_TIMEOUT_MS = 2500;
 
-/** How long a question put to the Codex binary may take before it counts as no answer. */
-const CODEX_PROBE_TIMEOUT_MS = 10_000;
+/**
+ * How long a question put to the Codex binary may take before it counts as no answer. Small on
+ * purpose: `SessionStart` blocks, two of these run in sequence, and a `codex --version` that takes
+ * longer than this is a binary that is not going to carry a Delegation either.
+ */
+const CODEX_PROBE_TIMEOUT_MS = 5_000;
 
 /**
  * The two Claude Code settings a sandboxed user needs, spelled as they are written there. Named
@@ -2916,7 +2930,15 @@ function askCodex(args) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   const said = oneLine([run.stdout, run.stderr].filter((stream) => filled(stream)).join(" "));
-  return { ran: !run.error, ok: !run.error && run.status === 0, status: run.status, said, error: run.error };
+  return {
+    ran: !run.error,
+    ok: !run.error && run.status === 0,
+    // A run killed by the timeout has no exit code at all, so how it ended is described rather than
+    // numbered — `exited null` is the shape of a report that stopped short of saying anything.
+    ended: run.status === null ? `did not answer within ${CODEX_PROBE_TIMEOUT_MS}ms` : `exited ${run.status}`,
+    said,
+    error: run.error,
+  };
 }
 
 /** `1 problem` / `2 problems`, because a readiness headline that says `1 problems` reads as a bug. */
@@ -2927,7 +2949,9 @@ const plural = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
  * not `ok` — the remedy is the whole product here, because every one of these failures otherwise
  * arrives minutes later as a Delegation that died without saying why.
  */
-function renderReadiness({ checks, failures, warnings, setup, root, settings, sources }) {
+function renderReadiness({ checks, setup, root, settings, sources }) {
+  const failures = checks.filter((check) => check.state === "fail");
+  const warnings = checks.filter((check) => check.state === "warn");
   const headline =
     failures.length > 0
       ? `Delegation readiness — **not ready**: ${plural(failures.length, "problem")}` +
@@ -2955,12 +2979,7 @@ function renderReadiness({ checks, failures, warnings, setup, root, settings, so
       "### The numbers in force",
       "",
     );
-    const settingWidth = Math.max(...Object.values(SETTINGS).map((spec) => spec.label.length));
-    for (const [key, spec] of Object.entries(SETTINGS)) {
-      out.push(
-        `  ${spec.label.padEnd(settingWidth)}  ${spec.format(settings[key]).padEnd(12)}  ${sources[key]}`,
-      );
-    }
+    out.push(...settingsTable(settings, sources));
     out.push(
       "",
       "Every one of them is **provisional**: none has been calibrated against real runs, and the" +
@@ -3047,7 +3066,7 @@ async function ready(args) {
     add(
       "Codex binary",
       "fail",
-      `${bin} exited ${version.status}: ${version.said}`,
+      `${bin} ${version.ended}: ${version.said}`,
       `\`${bin} --version\` does not answer, so the binary is there and will not run. Reinstall the` +
         " Codex CLI, or point `$DELEGATE_CODEX_BIN` at one that does.",
     );
@@ -3070,7 +3089,7 @@ async function ready(args) {
       add(
         "Authentication",
         "fail",
-        login.said || `codex login status exited ${login.status}`,
+        login.said || `codex login status ${login.ended}`,
         "run `codex login` in a terminal, or set `$CODEX_API_KEY`. A Delegation with no login" +
           " behind it fails at the provider — after the Budget was counted, because the Budget" +
           " counts what was asked of it.",
@@ -3210,17 +3229,19 @@ async function ready(args) {
     );
   }
 
-  const failures = checks.filter((check) => check.state === "fail");
-  const warnings = checks.filter((check) => check.state === "warn");
-  process.stdout.write(
-    renderReadiness({ checks, failures, warnings, setup, root, settings, sources }),
-  );
+  process.stdout.write(renderReadiness({ checks, setup, root, settings, sources }));
 
+  const failures = checks.filter((check) => check.state === "fail");
   if (failures.length > 0) {
-    // Also on stderr, and naming each one: stdout is what `SessionStart` carries into the session,
-    // and a harness that surfaces only the error channel must still say which precondition failed.
+    // The whole report again, on stderr, remedies included. A harness may carry only one of the two
+    // channels — and the one this exists for is not the verdict but what to do about it, so the
+    // failing checks are repeated whole rather than named. Duplicated on purpose: a message
+    // printed twice costs a reader a second look, and a message printed on the channel nobody
+    // reads costs them the fix.
     throw failed(
-      `delegation is not ready: ${failures.map((check) => `${check.label} — ${check.detail}`).join("; ")}`,
+      `delegation is not ready.\n${failures
+        .map((check) => `  ${check.label} — ${check.detail}${check.remedy === null ? "" : `\n    ${check.remedy}`}`)
+        .join("\n")}`,
     );
   }
 }

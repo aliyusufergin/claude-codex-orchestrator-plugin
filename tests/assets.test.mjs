@@ -416,9 +416,15 @@ describe("/delegate:setup", () => {
   });
 
   it("runs the same readiness check the session-start hook does", () => {
-    // D15: one check, two callers. A `/delegate:setup` with its own idea of what readiness means
-    // would pass a session the hook had already failed, or the reverse.
-    assert.match(body, /session start/i);
+    // One check, two callers, asserted against the hook rather than described: a `/delegate:setup`
+    // with its own idea of what readiness means would pass a session the hook had already failed,
+    // or the reverse, and nothing else in this repository would notice the two drifting apart.
+    const { hooks } = JSON.parse(readFileSync(path.join(REPO_ROOT, "hooks", "hooks.json"), "utf8"));
+    const [hookCommand] = hooks.SessionStart.flatMap((matcher) =>
+      matcher.hooks.map((hook) => hook.command),
+    );
+    const [, invocation] = body.match(/!`([^`]+)`/);
+    assert.equal(invocation, `${hookCommand} --setup`);
   });
 
   it("tells the Orchestrator not to carry out the remedies itself", () => {

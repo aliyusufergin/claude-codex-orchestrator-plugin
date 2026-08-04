@@ -71,7 +71,10 @@ describe("readiness", () => {
     assert.equal(run.code, 1);
     assert.match(run.stderr, /CODEX_HOME/);
     assert.match(run.stderr, new RegExp(fixture.codexHome));
+    // Both channels carry the remedy, not just the verdict: what this check exists to produce is
+    // the setting to add, and a harness may surface only one of the two.
     assert.match(run.stdout, /sandbox\.filesystem\.allowWrite/);
+    assert.match(run.stderr, /sandbox\.filesystem\.allowWrite/);
   });
 
   it("fails when there is no Codex binary to run", async (t) => {
@@ -82,6 +85,7 @@ describe("readiness", () => {
 
     assert.equal(run.code, 1);
     assert.match(run.stdout, new RegExp(missing));
+    assert.match(run.stderr, /install the Codex CLI/i);
   });
 
   it("fails when Codex is not logged in, and says which command fixes it", async (t) => {
