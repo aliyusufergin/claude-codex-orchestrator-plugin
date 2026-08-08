@@ -144,6 +144,25 @@ export function readSettings(stateRoot, { warn = () => {} } = {}) {
   return { values, sources };
 }
 
+/** The two numbers the Budget is bounded by, out of the settings table that holds them. */
+export const budgetLimits = (settings) => ({
+  ceiling: settings.budget_ceiling,
+  windowHours: settings.budget_window_hours,
+});
+
+/**
+ * The four numbers with their values and where each came from, as lines. Written once because both
+ * `/delegate:quota` and `/delegate:setup` print it, and two copies of a table read from the same
+ * source would still drift in the one way that matters — how it is laid out is what a user compares
+ * between the two commands.
+ */
+export function settingsTable(values, sources) {
+  const width = Math.max(...Object.values(SETTINGS).map((spec) => spec.label.length));
+  return Object.entries(SETTINGS).map(
+    ([key, spec]) => `  ${spec.label.padEnd(width)}  ${spec.format(values[key]).padEnd(12)}  ${sources[key]}`,
+  );
+}
+
 /**
  * Persist one number. This is the only place the plugin writes its own configuration, and
  * `/delegate:quota` is the only caller — the ceiling is the one place the bound is negotiable, and
