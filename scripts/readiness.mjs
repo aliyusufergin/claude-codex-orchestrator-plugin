@@ -22,6 +22,7 @@ import { parseArgs } from "node:util";
 import { budgetState } from "./budget.mjs";
 import { budgetLimits, readSettings, settingsTable } from "./config.mjs";
 import {
+  SANDBOX_BY_CLASS,
   SANDBOX_FALLBACK,
   WORKER_ENV_ALLOWLIST,
   codexBinary,
@@ -29,6 +30,7 @@ import {
   detectOuterSandbox,
   ensureWritable,
   platform,
+  sandboxHelperReady,
   sandboxHelperTmp,
   stateRoot,
   workerEnv,
@@ -297,14 +299,18 @@ export async function ready(args) {
     );
   }
 
-  // Codex's own sandbox helper, on the one platform where its obstacle was measured.
+  // Codex's own sandbox helper. Whether it can start is `environment.mjs`'s to say — the same
+  // predicate a Delegation's mode is chosen by — so this asks it rather than restating it. The
+  // platform is still read here, because the answer on a platform that was never probed is worth
+  // less to a reader than the name of the platform that was not probed.
+  const platformName = platform();
   const tmp = sandboxHelperTmp();
-  const helperReady = platform() !== "linux" || ensureWritable(tmp);
-  if (platform() !== "linux") {
+  const helperReady = sandboxHelperReady();
+  if (platformName !== "linux") {
     add(
       "Codex sandbox helper",
       "ok",
-      `${tmp} is not probed on ${platform()} — the precondition is a Linux implementation detail`,
+      `${tmp} is not probed on ${platformName} — the precondition is a Linux implementation detail`,
     );
   } else if (helperReady) {
     add("Codex sandbox helper", "ok", `${tmp} is writable, so Codex's own sandbox can start`);
@@ -330,13 +336,16 @@ export async function ready(args) {
   }
 
   // What a Delegation will actually be invoked with, said plainly: this is the flag the README has
-  // to explain, and a user reading a readiness report is owed the same honesty.
+  // to explain, and a user reading a readiness report is owed the same honesty. The modes come
+  // from the map `selectSandbox` returns them from, so the report cannot name one it would not
+  // pass; the Classes are named here rather than generated from that map's keys, because this is a
+  // sentence written for a person and a sentence assembled from keys reads like a map.
   const modes = helperReady
-    ? "`read-only` for Advisory, `workspace-write` for Verifiable"
+    ? `\`${SANDBOX_BY_CLASS.advisory}\` for Advisory, \`${SANDBOX_BY_CLASS.verifiable}\` for Verifiable`
     : `\`${SANDBOX_FALLBACK}\``;
   if (!sandboxed) {
     add("Outer sandbox", "ok", `none detected — Codex runs under its own sandbox: ${modes}`);
-  } else if (platform() === "darwin") {
+  } else if (platformName === "darwin") {
     add(
       "Outer sandbox",
       "warn",

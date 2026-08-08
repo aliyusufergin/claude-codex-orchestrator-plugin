@@ -38,7 +38,12 @@ import path from "node:path";
 
 import { failed } from "./errors.mjs";
 
-const SANDBOX_BY_CLASS = {
+/**
+ * The `-s` mode each Delegation Class asks for. Exported because readiness names these modes to
+ * the user, and a mode named in a report that is not the mode a Delegation is invoked with is the
+ * user being told the enforcement is something it is not.
+ */
+export const SANDBOX_BY_CLASS = {
   advisory: "read-only",
   verifiable: "workspace-write",
 };
@@ -157,6 +162,25 @@ export function ensureWritable(dir) {
 }
 
 /**
+ * Whether Codex's own sandbox helper can start here — the one precondition of ADR-0004's nesting
+ * whose absence is survivable. The other, a writable `$CODEX_HOME`, is not asked here because it
+ * has no mode to choose between: it kills `codex exec` under every one of them, so it is a hard
+ * failure both for readiness and for the Runner, never a fallback trigger.
+ *
+ * Linux only: the obstacle is an implementation detail of Codex's Linux sandbox helper, which is
+ * bubblewrap-based and builds its mount targets under `/tmp`. macOS pairs Seatbelt with Seatbelt
+ * and is unmeasured — it reads ready without being probed, on the same reasoning as ADR-0004's
+ * rule applying everywhere. That is a placeholder for a measurement: #16 decides what macOS does.
+ *
+ * A predicate and nothing else, because its two callers want different things from the one answer:
+ * `selectSandbox` wants a mode and refuses the Delegation unsandboxed, readiness wants a state and
+ * a remedy and never refuses. What they share is the measurement, not what either does about it.
+ */
+export function sandboxHelperReady() {
+  return platform() !== "linux" || ensureWritable(sandboxHelperTmp());
+}
+
+/**
  * Whether the Runner is itself inside a sandbox, measured by attempting a write outside the
  * working directory (ADR-0004). `$HOME` is the target because that is the boundary the probe
  * measured as holding: an outer sandbox grants the working directory and its subdirectories and
@@ -191,14 +215,9 @@ export function detectOuterSandbox() {
  */
 export function selectSandbox({ delegationClass, sandboxed }) {
   const preferred = SANDBOX_BY_CLASS[delegationClass];
+  if (sandboxHelperReady()) return { mode: preferred };
 
-  // Linux only: the obstacle is an implementation detail of Codex's Linux sandbox helper, which
-  // is bubblewrap-based and builds mount targets under `/tmp`. macOS pairs Seatbelt with Seatbelt
-  // and is unmeasured — it takes the preferred path, on the same reasoning as ADR-0004's rule
-  // applying everywhere. That is a placeholder for a measurement: #16 decides what macOS does.
   const tmp = sandboxHelperTmp();
-  if (platform() !== "linux" || ensureWritable(tmp)) return { mode: preferred };
-
   const cause = `${tmp} is not writable, so Codex's sandbox helper cannot start`;
   if (!sandboxed) throw failed(`${cause} — allow writes to it, or Codex runs unprotected`);
   return { mode: SANDBOX_FALLBACK, reason: `${cause}; allow writes to it to keep both sandboxes on` };
