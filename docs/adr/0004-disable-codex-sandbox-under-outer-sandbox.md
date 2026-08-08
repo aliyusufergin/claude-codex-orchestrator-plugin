@@ -40,7 +40,11 @@ instead, naming `/tmp`.
 implementation detail of Codex's Linux sandbox helper. macOS is unmeasured
 ([#16](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/16)) and takes the
 preferred path — two enforcing layers is the better guess to hold until it is measured, and it is
-the same "Linux conclusion applied everywhere" this ADR already commits to under "Scope".
+the same "Linux conclusion applied everywhere" this ADR already commits to under "Scope". Applied
+there, but not silently: on `darwin` with an outer sandbox detected, readiness reports this
+conclusion as **unverified on this platform**
+([#13](https://github.com/aliyusufergin/claude-codex-orchestrator-plugin/issues/13)), so a mac user
+knows they are on untested ground rather than being handed a guess as a measurement.
 
 ## Original decision, 2026-08-02 — superseded, kept for the failure it documents
 

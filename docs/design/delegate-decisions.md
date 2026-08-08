@@ -404,16 +404,38 @@ Budget state). `SessionEnd` performs the narrow collection of D22. A `Stop` revi
 shipped, even disabled: full autonomy already covers it, and it would compete with the Budget for
 the same window.
 
-*`SessionEnd` ships on #12*, as `runner.mjs sweep` in `hooks/hooks.json`; `SessionStart` waits for
-#13, which is where readiness is decided. The absence of the `Stop` gate is asserted rather than
-merely intended: the asset lint reads every hook declaration the plugin ships and fails on a `Stop`
-key in any of them. That is the one lint in this repository whose subject is a file that is *not*
-there, which is exactly the kind of decision that erodes silently — a disabled `Stop` hook is not a
-compromise between the two positions, it is this one made in a file the user is invited to flip.
+*`SessionEnd` ships on #12*, as `runner.mjs sweep` in `hooks/hooks.json`; *`SessionStart` ships on
+#13*, as `runner.mjs ready` beside it, with no matcher — a resumed or cleared session has the same
+preconditions as a fresh one, and none of them is measured until it is asked. The absence of the
+`Stop` gate is asserted rather than merely intended: the asset lint reads every hook declaration the
+plugin ships and fails on a `Stop` key in any of them. That is the one lint in this repository whose
+subject is a file that is *not* there, which is exactly the kind of decision that erodes silently —
+a disabled `Stop` hook is not a compromise between the two positions, it is this one made in a file
+the user is invited to flip.
 
 *The sweep never fails the session.* A wrong invocation is a usage error like any other, but a
 Workspace it could not remove is reported on stderr and exits `0`. A session ending is not a moment
 to hand the user an error about bookkeeping they did not ask for and cannot act on.
+
+*Readiness does the opposite, and deliberately.* Eight checks — the binary, the login, `$CODEX_HOME`,
+the state directory the Ledger lives in, Codex's sandbox helper, the outer sandbox, the provider's
+host, and the Budget — each ending `ok`, `warn` or `fail`. The report goes to stdout whichever way
+they come out, because that is the channel `SessionStart` carries into the session; a `fail`
+additionally exits `1` naming what failed, so a harness surfacing only the error channel still says
+which precondition it was. What separates the two states is whether the user has an installation
+that cannot delegate at all: no binary, no login, an unwritable `$CODEX_HOME` or state directory, or
+a `/tmp` the Runner will refuse over. A spent Budget, an unreachable host behind a proxy the probe
+cannot see, an unmeasured platform, and the `danger-full-access` fallback are all states to weigh
+rather than faults, so they warn.
+
+*Two of the checks are measurements the Worker's own environment decides.* The login is asked
+through `workerEnv()` rather than by reading a file, because a credential that does not survive the
+allowlist is one the Worker does not have — and an API key on the allowlist is read as
+authentication without asking Codex at all, since `codex exec` authenticates with it whatever
+`codex login status` reports. The provider's host is probed as a TCP connect and only under an outer
+sandbox: unsandboxed there is nothing holding the connection, and telling a merely offline user to
+edit `sandbox.network.allowedDomains` would name the wrong cause (O2). Readiness never spends a
+token of the user's allowance to find out whether the network is there.
 
 **Command surface** *(derived from the decisions, not separately decided)*:
 
@@ -427,10 +449,16 @@ to hand the user an error about bookkeeping they did not ask for and cannot act 
 | `/delegate:quota` | Budget state; raise the ceiling |
 | `/delegate:clean` | Collect unlanded Workspaces and branches |
 
-Shipped so far: `/delegate:result` and `/delegate:quota` (#5, #7), `/delegate:status` and
-`/delegate:cancel` (#9), `/delegate:apply` (#10), `/delegate:clean` (#12). All six are
-`disable-model-invocation` — they are the user's commands, and the Orchestrator reaches a Delegation
-through a Forwarder or not at all.
+Shipped: `/delegate:result` and `/delegate:quota` (#5, #7), `/delegate:status` and
+`/delegate:cancel` (#9), `/delegate:apply` (#10), `/delegate:clean` (#12), `/delegate:setup` (#13).
+All seven are `disable-model-invocation` — they are the user's commands, and the Orchestrator
+reaches a Delegation through a Forwarder or not at all. `/delegate:setup` is `runner.mjs ready
+--setup`: the same eight checks the `SessionStart` hook runs, with the configuration behind them —
+the four numbers and where each came from, the environment allowlist, where state lives, and why the
+plugin ships off. Every remedy it prints is the user's to carry out, and the command says so: an
+Orchestrator that ran `codex login`, added a `sandbox.filesystem.allowWrite` entry or raised the
+ceiling would be answering for the user on exactly the questions this plugin exists to leave with
+them.
 
 *The Landing itself is not a command*, and that asymmetry is deliberate. `runner.mjs land <id>` is
 the Orchestrator's own step, taken once it has read the diff and subject to the two refusals it
@@ -613,10 +641,23 @@ implementation detail of Codex's Linux sandbox helper and does not transfer to S
 macOS needs the general question asked afresh — does Codex's macOS sandbox need any writable path
 Claude Code denies? Open as #16.
 
+*Said out loud rather than assumed, since #13.* On `darwin` with an outer sandbox detected,
+readiness reports ADR-0004's conclusion as **unverified on this platform** and names what is being
+guessed: Delegations still take the preferred path, because two enforcing layers is the better guess
+to hold until it is measured, and the user is told to watch for the shape a wrong guess takes — a
+Worker that reports success and writes nothing. The `/tmp` precondition is not probed there at all,
+because it is an implementation detail of Codex's Linux helper and failing a mac session on it would
+be reporting a measurement nobody took.
+
 **O2 — Network under an outer sandbox.** Claude Code pre-allows no domains, so a sandboxed user may
 need the OpenAI API host in `sandbox.network.allowedDomains`. Untested — both probe runs shared the
 host network, because both reconstructed the outer sandbox rather than running under a real one.
 Answering it is part of #16's Linux half, which needs no special hardware.
+
+*Measured per session rather than answered once, since #13.* Readiness probes the host with a TCP
+connect when — and only when — an outer sandbox is detected, and names the setting when it does not
+answer. That does not settle the question: the probe is not the Worker, and a proxy it cannot see
+may still carry the connection, which is why an unreachable host warns rather than fails.
 
 **O3 — Numeric defaults.** Budget ceiling per window, dedup TTL, and the diff-size threshold above
 which the Orchestrator stops reading and asks. To be calibrated, not guessed.

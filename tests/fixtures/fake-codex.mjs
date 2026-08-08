@@ -13,6 +13,9 @@
 // Recognised config keys, all optional:
 //   readStdin       read stdin to EOF before doing anything (default true — real `codex exec`
 //                   does this, and it is what hangs forever on an inherited open stdin)
+//   version         what `codex --version` prints (default `codex-cli 0.146.0`)
+//   versionExitCode its exit code (default 0) — a binary that is there and will not run
+//   loggedIn        set false to make `codex login status` report no login and exit 1
 //   events          array of objects emitted as JSONL on stdout (default: a canned turn)
 //   streamPayload   payload embedded double-encoded in the default stream's agent_message.text
 //   streamTail      text written to stdout after the events, verbatim and with no trailing
@@ -119,6 +122,27 @@ async function readStdinBytes() {
 const config = readConfig();
 const argv = process.argv.slice(2);
 const { flags, positionals, command, operands } = parseArgv(argv);
+
+// The two questions readiness asks of the binary itself, answered before anything else. A real
+// `codex --version` and `codex login status` read no stdin and emit no event stream, and neither
+// is a Delegation — so they are appended to the invocation log, where a test can ask what was
+// asked, and deliberately do not overwrite `fake-codex-invocation.json`, which the rest of this
+// suite reads as "Codex was invoked".
+const probe = argv.includes("--version") ? "--version" : command[0] === "login" ? command.join(" ") : null;
+if (probe) {
+  appendFileSync(
+    path.join(stateDir, "fake-codex-invocations.jsonl"),
+    `${JSON.stringify({ argv: process.argv, args: argv, subcommand: probe, probe: true })}\n`,
+  );
+  if (probe === "--version") {
+    process.stdout.write(`${config.version ?? "codex-cli 0.146.0"}\n`);
+    process.exit(config.versionExitCode ?? 0);
+  }
+  // `codex login status` exits non-zero and says so when there is no login behind it.
+  const loggedIn = config.loggedIn !== false;
+  process.stdout.write(loggedIn ? "Logged in using ChatGPT\n" : "Not logged in\n");
+  process.exit(loggedIn ? 0 : 1);
+}
 
 const stdinBytes = config.readStdin === false ? null : await readStdinBytes();
 
