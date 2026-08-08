@@ -694,7 +694,7 @@ deleted because the negative result is the reason no code branches on the settin
 allowlist of environment variables to the Codex subprocess rather than inheriting `process.env`. A
 Worker is a third-party agent; anything in the Orchestrator's environment — API tokens, cloud
 credentials — would otherwise flow into its process and into every command it runs. The set is the
-`WORKER_ENV_ALLOWLIST` constant in `scripts/runner.mjs`, extended by the user through
+`WORKER_ENV_ALLOWLIST` constant in `scripts/environment.mjs`, extended by the user through
 `DELEGATE_ENV_ALLOWLIST`. Two details worth keeping: the Runner's own `DELEGATE_*` configuration is
 not on it, and `OPENAI_API_KEY` is deliberately excluded because `codex exec` never reads it —
 `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN` are the runtime auth variables.

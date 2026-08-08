@@ -7,9 +7,8 @@
 //   1  the Delegation failed
 //   2  the invocation was wrong
 //
-// The Worker process contract — sandbox-mode selection (ADR-0004) and the environment allowlist —
-// is here, as is the Advisory path end to end for all three of its Task Kinds: prompt template,
-// output schema, reasoning effort, persistence, event-stream reconciliation, thread resume with its
+// The Advisory path is here end to end for all three of its Task Kinds: prompt template, output
+// schema, reasoning effort, persistence, event-stream reconciliation, thread resume with its
 // visible fallback (D11), and the compact rendering the Orchestrator gets. So is the bound of
 // ADR-0002: the Delegation Budget and the dedup cache, enforced here rather than in any agent or
 // command prompt. The Verifiable path is here too: the Workspace lifecycle (`workspace.mjs`), the
@@ -19,23 +18,22 @@
 // large to be worth reading, and `/delegate:apply` is the user's way past both. What outlives a
 // session is here as well: `sweep` is the `SessionEnd` hook's narrow collection of D22 — Landed and
 // untouched Workspaces, nothing else — and `clean` is `/delegate:clean`, the user asking for the
-// unlanded ones to go too. What comes *before* all of it is here too: `ready` is the `SessionStart`
-// hook and the readiness half of `/delegate:setup`, which measures the preconditions a Delegation
-// would otherwise fail on minutes later without explaining itself.
+// unlanded ones to go too.
 //
-// Environment variables the Runner reads for itself. None reaches the Worker unless the user
-// puts it on the allowlist by name. The four numbers the plugin enforces have their own
-// environment variables, listed in `config.mjs`.
-//   DELEGATE_ENV_ALLOWLIST   extra names or `PREFIX*` globs added to the Worker's environment
-//   DELEGATE_STATE_DIR       where Results, the Budget ledger and the dedup cache live
-//   DELEGATE_CODEX_BIN       the Codex binary, for the test seam
-//   DELEGATE_SANDBOXED       `1`/`0` short-circuits outer-sandbox detection, for the test seam —
-//                            detection is a measurement, and this is not a way to configure it
-//   DELEGATE_TMP_DIR         the directory probed in place of `/tmp`, for the test seam
-//   DELEGATE_PLATFORM        the platform the sandbox rules are decided against, for the test seam
-//   DELEGATE_API_HOST        `host[:port]` probed in place of the provider's API, for the test seam
+// What is not here is what the Runner shares with something else. The Worker process contract —
+// sandbox-mode selection (ADR-0004), the environment allowlist, and every other measurement this
+// plugin takes of the machine it is on — is `environment.mjs`, because the Delegation path and
+// readiness have to decide against the same machine and neither owns it. `ready` itself is
+// `readiness.mjs`: the `SessionStart` hook and the readiness half of `/delegate:setup`, which
+// measures the preconditions a Delegation would otherwise fail on minutes later without explaining
+// itself. Both are dispatched to from here and defined in neither direction, so that this stays a
+// command rather than becoming a library with a `main` attached.
+//
+// The Runner reads no environment variable of its own: every one the plugin recognises is listed
+// in the module that reads it — `environment.mjs`, `readiness.mjs` and `config.mjs`, and nowhere
+// else. None of them reaches a Worker unless the user puts it on the allowlist by name.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
@@ -44,11 +42,8 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import net from "node:net";
-import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -63,7 +58,20 @@ import {
   repoIdentity,
   uncommittedDigest,
 } from "./budget.mjs";
-import { SETTINGS, readSettings, writeSetting } from "./config.mjs";
+import { SETTINGS, budgetLimits, readSettings, settingsTable, writeSetting } from "./config.mjs";
+import {
+  codexBinary,
+  codexHome,
+  detectOuterSandbox,
+  ensureWritable,
+  sandboxWritableRoots,
+  selectSandbox,
+  stateRoot,
+  workerEnv,
+} from "./environment.mjs";
+import { EXIT_OK, EXIT_USAGE, RunnerError, failed, usageError, warn } from "./errors.mjs";
+import { ready } from "./readiness.mjs";
+import { filled, oneLine, text } from "./text.mjs";
 import {
   applyPatch,
   createWorkspace,
@@ -81,10 +89,6 @@ import {
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMA_DIR = path.join(PLUGIN_ROOT, "schemas");
 const PROMPT_DIR = path.join(PLUGIN_ROOT, "prompts");
-
-const EXIT_OK = 0;
-const EXIT_FAILED = 1;
-const EXIT_USAGE = 2;
 
 const USAGE = `usage: runner.mjs delegate --kind <kind> --prompt <text|-> [--cwd <dir>] [--thread <id>]
        runner.mjs status
@@ -160,9 +164,6 @@ const RESULT_ID = /^[a-z]+-[0-9a-f]{8}$/;
 /** How much of one finding's `evidence` the compact rendering carries before it points at the file. */
 const EVIDENCE_MAX_LINES = 40;
 
-/** How much of a Worker's own text a one-line quotation of it carries. */
-const ONE_LINE_MAX_CHARS = 120;
-
 /** How much of the Worker's closing claim a reconciliation failure quotes back. */
 const CLAIM_MAX_CHARS = 240;
 
@@ -200,198 +201,6 @@ const RESUME_REFUSED = /thread\/resume/i;
  * change costs a false failure, which is visible and paid for once, not a missed one.
  */
 const WRITE_DENIED_BY_POLICY = /patch rejected|read-only sandbox/i;
-
-const SANDBOX_BY_CLASS = {
-  advisory: "read-only",
-  verifiable: "workspace-write",
-};
-
-/** The fallback mode of ADR-0004, reached only when a precondition for nesting is missing. */
-const SANDBOX_FALLBACK = "danger-full-access";
-
-/**
- * The Worker's environment. A Worker is a third-party agent: it inherits nothing implicitly, and
- * every command it runs sees only what is listed here. Entries ending in `*` match by prefix.
- *
- * The set covers what Codex needs to start and what a build needs to run. `CODEX_API_KEY` and
- * `CODEX_ACCESS_TOKEN` are the two variables Codex's runtime auth chain actually reads;
- * `OPENAI_API_KEY` is deliberately absent, because `codex exec` never reads it — it only prefills
- * a field in the interactive TUI, so passing it would leak a secret that buys nothing.
- *
- * A user extends this through `DELEGATE_ENV_ALLOWLIST` rather than editing it.
- */
-const WORKER_ENV_ALLOWLIST = [
-  "PATH",
-  "HOME",
-  "USER",
-  "SHELL",
-  "LANG",
-  "LC_*",
-  "TERM",
-  "TMPDIR",
-  "CODEX_HOME",
-  "CODEX_API_KEY",
-  "CODEX_ACCESS_TOKEN",
-];
-
-/** Anything that ends the run with a message on stderr and a non-zero exit code. */
-class RunnerError extends Error {
-  constructor(message, code) {
-    super(message);
-    this.code = code;
-  }
-}
-
-const usageError = (message) => new RunnerError(message, EXIT_USAGE);
-const failed = (message) => new RunnerError(message, EXIT_FAILED);
-
-/**
- * Resolve the Codex binary. Never through `npx` — Claude Code's permission wrapper-stripping
- * does not cover it, so an `npx codex` invocation prompts on a rule the user cannot write.
- */
-function codexBinary() {
-  return process.env.DELEGATE_CODEX_BIN || "codex";
-}
-
-/** `$CODEX_HOME`, resolved the way Codex resolves it. */
-function codexHome() {
-  const configured = process.env.CODEX_HOME?.trim();
-  return configured ? path.resolve(configured) : path.join(homedir(), ".codex");
-}
-
-/**
- * The directories Codex's sandbox helper may be handed as writable and build its synthetic mount
- * targets under: `/tmp`, and `$TMPDIR` where the machine puts that somewhere else. Nothing the
- * Runner depends on outliving a run may live under either — a path there is mounted over, and the
- * Worker's writes into it are reported as successful and are gone afterwards (C6, ADR-0004).
- *
- * `$DELEGATE_TMP_DIR` *replaces* the set rather than joining it. It is the seam that stands in for
- * `/tmp`, and a test that could not move the machine's own `/tmp` out of the way could not exercise
- * this rule at all — every fixture directory it owns is under it.
- */
-function sandboxWritableRoots() {
-  const seam = process.env.DELEGATE_TMP_DIR?.trim();
-  if (seam) return [seam];
-  return [...new Set(["/tmp", tmpdir()])];
-}
-
-/** The directory Codex's Linux sandbox helper builds its synthetic mount targets under. */
-function sandboxHelperTmp() {
-  return sandboxWritableRoots()[0];
-}
-
-/**
- * The platform the sandbox rules are decided against. Everything ADR-0004 measured is Linux, and
- * two of its rules ask what platform this is — the `/tmp` precondition, which is an implementation
- * detail of Codex's Linux sandbox helper, and readiness saying so on the platform where the
- * conclusion is unverified.
- *
- * `$DELEGATE_PLATFORM` is the test seam. Like `$DELEGATE_SANDBOXED` it stands in for a measurement
- * rather than configuring one: a mac user cannot make the Linux conclusion apply by setting it.
- */
-function platform() {
-  return process.env.DELEGATE_PLATFORM?.trim() || process.platform;
-}
-
-/**
- * Create `dir` if it is missing and report whether it can be written to — a measurement, not a
- * reading of permission bits, because a sandbox denies the write without changing them.
- */
-function ensureWritable(dir) {
-  const probe = path.join(dir, `.delegate-write-probe-${process.pid}`);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(probe, "");
-    return true;
-  } catch {
-    return false;
-  } finally {
-    try {
-      unlinkSync(probe);
-    } catch {
-      // The probe is gone or was never created; either way there is nothing to clean up.
-    }
-  }
-}
-
-/**
- * Whether the Runner is itself inside a sandbox, measured by attempting a write outside the
- * working directory (ADR-0004). `$HOME` is the target because that is the boundary the probe
- * measured as holding: an outer sandbox grants the working directory and its subdirectories and
- * refuses `$HOME`.
- *
- * A working directory that *is* `$HOME` reads as unsandboxed. That costs little now that the
- * sandboxed and unsandboxed paths pick the same modes.
- */
-function detectOuterSandbox() {
-  const forced = process.env.DELEGATE_SANDBOXED?.trim();
-  if (forced === "1") return true;
-  if (forced === "0") return false;
-
-  const home = homedir();
-  if (!home || path.resolve(process.cwd()) === path.resolve(home)) return false;
-  return !ensureWritable(home);
-}
-
-/**
- * The `-s` mode for one Delegation, per ADR-0004. Under an outer sandbox the preference is to
- * leave Codex's own sandbox on, so that both layers enforce; `danger-full-access` is what is left
- * when the preconditions for nesting are missing, and the alternative to it is not "two layers"
- * but "nothing runs".
- *
- * The `/tmp` precondition is measured independently of the outer-sandbox probe, because Codex's
- * sandbox helper needs it either way. What a failure means differs: sandboxed, the outer jail is
- * still holding, so dropping Codex's own sandbox costs a layer and keeps the Delegation running;
- * unsandboxed there is no other boundary, and `danger-full-access` would be the only thing left
- * standing between a third-party agent and the machine. So that case refuses instead.
- *
- * Returns the mode, plus the diagnostic to print when it is not the preferred one.
- */
-function selectSandbox({ delegationClass, sandboxed }) {
-  const preferred = SANDBOX_BY_CLASS[delegationClass];
-
-  // Linux only: the obstacle is an implementation detail of Codex's Linux sandbox helper, which
-  // is bubblewrap-based and builds mount targets under `/tmp`. macOS pairs Seatbelt with Seatbelt
-  // and is unmeasured — it takes the preferred path, on the same reasoning as ADR-0004's rule
-  // applying everywhere. That is a placeholder for a measurement: #16 decides what macOS does.
-  const tmp = sandboxHelperTmp();
-  if (platform() !== "linux" || ensureWritable(tmp)) return { mode: preferred };
-
-  const cause = `${tmp} is not writable, so Codex's sandbox helper cannot start`;
-  if (!sandboxed) throw failed(`${cause} — allow writes to it, or Codex runs unprotected`);
-  return { mode: SANDBOX_FALLBACK, reason: `${cause}; allow writes to it to keep both sandboxes on` };
-}
-
-/**
- * The environment one Worker sees. Everything not on the allowlist is dropped, including the
- * Runner's own `DELEGATE_*` configuration. `CODEX_HOME` is passed explicitly rather than copied,
- * so that the Worker resolves the same directory the Runner checked for writability.
- */
-function workerEnv() {
-  const extra = (process.env.DELEGATE_ENV_ALLOWLIST ?? "")
-    .split(/[,\s]+/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-
-  const exact = new Set();
-  const prefixes = [];
-  for (const entry of [...WORKER_ENV_ALLOWLIST, ...extra]) {
-    // A bare `*` is dropped rather than honoured: an empty prefix matches every name, which turns
-    // the allowlist back into the inheritance it exists to replace — silently, and in the one
-    // place in this plugin where a silent failure leaks the user's secrets.
-    if (entry === "*") continue;
-    if (entry.endsWith("*")) prefixes.push(entry.slice(0, -1));
-    else exact.add(entry);
-  }
-
-  const env = {};
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value === undefined) continue;
-    if (exact.has(name) || prefixes.some((prefix) => name.startsWith(prefix))) env[name] = value;
-  }
-  env.CODEX_HOME = codexHome();
-  return env;
-}
 
 /**
  * The prompt one Worker is given: the Task Kind's template with the Orchestrator's request dropped
@@ -527,31 +336,11 @@ function onCancellation() {
   if (activeChild) activeChild.kill("SIGTERM");
 }
 
-/**
- * Whether a Worker filled a string field in at all. Every Result reaches the checks and the
- * renderings having been reported as imperfect rather than refused, so both halves ask this the
- * same way: a missing field costs a line, never the answer.
- */
-function filled(value) {
-  return typeof value === "string" && value.trim() !== "";
-}
-
-/** A Worker's string field, trimmed, or the fallback when it left the field empty. */
-function text(value, fallback = "") {
-  return filled(value) ? value.trim() : fallback;
-}
-
 /** The line every rendering closes with: the Result's id, and where the whole of it is. */
 function resultFooter(id, persisted) {
   return persisted
     ? `Result \`${id}\` — the whole payload is at \`/delegate:result ${id}\`.`
     : `Result \`${id}\` — not persisted, so this rendering is all of it.`;
-}
-
-/** A Worker's text on one line, collapsed and capped — for the places the Runner quotes it inline. */
-function oneLine(value, max = ONE_LINE_MAX_CHARS) {
-  const collapsed = String(value ?? "").replace(/\s+/g, " ").trim();
-  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
 }
 
 /** Whatever an event carries as its message, as one line — a string, or the object it hid in. */
@@ -898,22 +687,6 @@ async function runCodex({
   }
 }
 
-/**
- * Where the plugin's own state lives: Results, the Budget ledger, the dedup cache and the user's
- * settings. `$CLAUDE_PLUGIN_DATA` is the harness's persistent directory and survives plugin
- * updates, which `${CLAUDE_PLUGIN_ROOT}` explicitly does not — but the Runner is also invoked
- * outside a plugin install, and under an outer sandbox `$HOME` is not writable. `$CODEX_HOME` is,
- * because a Delegation has already failed by then if it is not, so it is the fallback.
- *
- * All of it is outside any repository. That is required of the Budget, which is the Worker's
- * provider's and spans every repository the user works in, and it is what keeps a Worker's Result
- * out of the user's source tree.
- */
-function stateRoot() {
-  const configured = process.env.DELEGATE_STATE_DIR?.trim() || process.env.CLAUDE_PLUGIN_DATA?.trim();
-  return configured ? path.resolve(configured) : path.join(codexHome(), "delegate");
-}
-
 function resultsDir() {
   return path.join(stateRoot(), "results");
 }
@@ -1037,12 +810,6 @@ function processAlive(pid) {
   }
 }
 
-/** The two numbers the Budget is bounded by, out of the settings table that holds them. */
-const budgetLimits = (settings) => ({
-  ceiling: settings.budget_ceiling,
-  windowHours: settings.budget_window_hours,
-});
-
 /**
  * Refuse anything passed to a subcommand that takes nothing. An empty argument is no argument: a
  * command invoked with nothing after it reaches the Runner as one empty string.
@@ -1050,11 +817,6 @@ const budgetLimits = (settings) => ({
 function takesNoArguments(args) {
   const [unexpected] = args.filter((arg) => arg.trim() !== "");
   if (unexpected) throw usageError(`unexpected argument: ${unexpected}`);
-}
-
-/** Anything the Runner has to say for itself, on the channel that is diagnostic by contract. */
-function warn(message) {
-  process.stderr.write(`${message}\n`);
 }
 
 /**
@@ -1073,19 +835,6 @@ function budgetRefusal(state) {
     `${state.windowHours}h, and the ceiling is ${state.ceiling}. Nothing was delegated.${frees}` +
     " Raise the ceiling with `/delegate:quota <n>` if this window's work is worth it — that is the" +
     " one place this bound is negotiable."
-  );
-}
-
-/**
- * The four numbers with their values and where each came from, as lines. Written once because both
- * `/delegate:quota` and `/delegate:setup` print it, and two copies of a table read from the same
- * source would still drift in the one way that matters — how it is laid out is what a user compares
- * between the two commands.
- */
-function settingsTable(values, sources) {
-  const width = Math.max(...Object.values(SETTINGS).map((spec) => spec.label.length));
-  return Object.entries(SETTINGS).map(
-    ([key, spec]) => `  ${spec.label.padEnd(width)}  ${spec.format(values[key]).padEnd(12)}  ${sources[key]}`,
   );
 }
 
@@ -2865,385 +2614,6 @@ function clean(args) {
       notes,
     ),
   );
-}
-
-/**
- * Where the Worker's provider is reached. Probed only to answer one question — whether an outer
- * sandbox is holding the connection — so it is a TCP connect and never a request: readiness is not
- * entitled to spend a token of the user's allowance finding out whether the network is there.
- */
-const API_HOST = "api.openai.com";
-const API_PORT = 443;
-
-/** How long that probe waits before the host counts as unreachable. `SessionStart` is blocking. */
-const API_PROBE_TIMEOUT_MS = 2500;
-
-/**
- * How long a question put to the Codex binary may take before it counts as no answer. Small on
- * purpose: `SessionStart` blocks, two of these run in sequence, and a `codex --version` that takes
- * longer than this is a binary that is not going to carry a Delegation either.
- */
-const CODEX_PROBE_TIMEOUT_MS = 5_000;
-
-/**
- * The two Claude Code settings a sandboxed user needs, spelled as they are written there. Named
- * constants because readiness is the only place the plugin can tell them about either, and a
- * setting named approximately is one the user cannot search for.
- */
-const ALLOW_WRITE = "sandbox.filesystem.allowWrite";
-const ALLOWED_DOMAINS = "sandbox.network.allowedDomains";
-
-/** The provider endpoint readiness probes, or the one `$DELEGATE_API_HOST` stands in with. */
-function apiEndpoint() {
-  const configured = process.env.DELEGATE_API_HOST?.trim();
-  if (!configured) return { host: API_HOST, port: API_PORT };
-  const [, host, port] = configured.match(/^(.*?)(?::(\d+))?$/);
-  return { host: host || API_HOST, port: port ? Number(port) : API_PORT };
-}
-
-/** Whether the provider's host answers at all, and what it said if it did not. */
-function probeApiHost({ host, port }) {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host, port });
-    const settle = (reachable, detail) => {
-      socket.destroy();
-      resolve({ reachable, detail });
-    };
-    socket.setTimeout(API_PROBE_TIMEOUT_MS);
-    socket.once("connect", () => settle(true, "it answered"));
-    socket.once("timeout", () => settle(false, `no answer within ${API_PROBE_TIMEOUT_MS}ms`));
-    socket.once("error", (error) => settle(false, error.message));
-  });
-}
-
-/**
- * Ask the Codex binary one question, under the same filtered environment a Worker gets. That is
- * the point of asking it here rather than reading a file: a login that exists but does not survive
- * the allowlist is a login the Worker does not have.
- */
-function askCodex(args) {
-  const run = spawnSync(codexBinary(), args, {
-    env: workerEnv(),
-    encoding: "utf8",
-    timeout: CODEX_PROBE_TIMEOUT_MS,
-    // stdin is /dev/null for the same reason every other invocation's is.
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const said = oneLine([run.stdout, run.stderr].filter((stream) => filled(stream)).join(" "));
-  return {
-    ran: !run.error,
-    ok: !run.error && run.status === 0,
-    // A run killed by the timeout has no exit code at all, so how it ended is described rather than
-    // numbered — `exited null` is the shape of a report that stopped short of saying anything.
-    ended: run.status === null ? `did not answer within ${CODEX_PROBE_TIMEOUT_MS}ms` : `exited ${run.status}`,
-    said,
-    error: run.error,
-  };
-}
-
-/** `1 problem` / `2 problems`, because a readiness headline that says `1 problems` reads as a bug. */
-const plural = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
-
-/**
- * The readiness report. One line per check with its state, then what to do about anything that is
- * not `ok` — the remedy is the whole product here, because every one of these failures otherwise
- * arrives minutes later as a Delegation that died without saying why.
- */
-function renderReadiness({ checks, setup, root, settings, sources }) {
-  const failures = checks.filter((check) => check.state === "fail");
-  const warnings = checks.filter((check) => check.state === "warn");
-  const headline =
-    failures.length > 0
-      ? `Delegation readiness — **not ready**: ${plural(failures.length, "problem")}` +
-        `${warnings.length > 0 ? `, ${plural(warnings.length, "warning")}` : ""}.`
-      : warnings.length > 0
-        ? `Delegation readiness — ready, with ${plural(warnings.length, "warning")}.`
-        : "Delegation readiness — ready.";
-
-  const badge = { ok: "ok  ", warn: "warn", fail: "FAIL" };
-  const width = Math.max(...checks.map((check) => check.label.length));
-  const out = [headline, ""];
-  for (const check of checks) {
-    out.push(`  ${badge[check.state]}  ${check.label.padEnd(width)}  ${check.detail}`);
-  }
-
-  const actionable = [...failures, ...warnings].filter((check) => check.remedy !== null);
-  if (actionable.length > 0) {
-    out.push("", "### What to do", "");
-    for (const check of actionable) out.push(`- **${check.label}** — ${check.remedy}`);
-  }
-
-  if (setup) {
-    out.push(
-      "",
-      "### The numbers in force",
-      "",
-    );
-    out.push(...settingsTable(settings, sources));
-    out.push(
-      "",
-      "Every one of them is **provisional**: none has been calibrated against real runs, and the" +
-        " Ledger records what that calibration will need. Each is overridable by its environment" +
-        " variable and by `settings.json` in the state directory, the environment winning." +
-        " `/delegate:quota <n>` is the one that is negotiated rather than edited.",
-      "",
-      "### What a Worker can see",
-      "",
-      `A Worker is a third-party agent, so its environment is an allowlist and not an inheritance:` +
-        ` ${WORKER_ENV_ALLOWLIST.join(", ")}. Everything else — every API token and cloud` +
-        " credential in this shell — is dropped, including the Runner's own `DELEGATE_*` settings." +
-        " Add a name or a `PREFIX*` glob to `$DELEGATE_ENV_ALLOWLIST` to extend it for a project" +
-        " that needs one.",
-      "",
-      `State lives at ${root}, outside every repository: Results, the Ledger the Budget is counted` +
-        " from, the dedup cache and your own numbers. Workspaces live beside it, never under `/tmp`.",
-      "",
-      "The plugin ships `defaultEnabled: false`, because installing it is not the same act as" +
-        " consenting to autonomous delegation. Enable it in `/plugin` when you mean it; the six" +
-        " Forwarders then invite proactive use, bounded by the Delegation Budget above.",
-    );
-  } else {
-    out.push(
-      "",
-      "`/delegate:setup` runs this same check and shows the configuration behind it;" +
-        " `/delegate:quota` shows the Budget on its own.",
-    );
-  }
-  return `${out.join("\n")}\n`;
-}
-
-/**
- * `runner.mjs ready` — the `SessionStart` hook, and the readiness half of `/delegate:setup`.
- *
- * Every check here is a failure that would otherwise surface minutes later as confusing behaviour:
- * no binary, no login, a Budget already spent, a `$CODEX_HOME` that cannot be written — which kills
- * `codex exec` before it emits a single event, `--ephemeral` or not. Two of them exist because a
- * sandboxed user has preconditions nobody told them about, and both are named as the settings they
- * are: the write allowances of ADR-0004's consequences, and the API host Claude Code does not
- * pre-allow.
- *
- * The report goes to stdout whether or not anything failed, because that is the channel
- * `SessionStart` carries into the session, and a hard failure additionally exits `1` naming what
- * failed. A warning never does: a spent Budget, an unreachable host behind a proxy this cannot see,
- * and an unmeasured platform are all states the user can weigh, not broken installations.
- */
-async function ready(args) {
-  let values;
-  try {
-    ({ values } = parseArgs({
-      args,
-      strict: true,
-      allowPositionals: false,
-      options: { setup: { type: "boolean" } },
-    }));
-  } catch (error) {
-    throw usageError(error.message);
-  }
-  const setup = values.setup === true;
-
-  const checks = [];
-  const add = (label, state, detail, remedy = null) => checks.push({ label, state, detail, remedy });
-
-  const sandboxed = detectOuterSandbox();
-  const home = codexHome();
-  const root = stateRoot();
-  const { values: settings, sources } = readSettings(root, { warn });
-
-  // The binary, first: everything below it is a question about a Codex that is there.
-  const bin = codexBinary();
-  const version = askCodex(["--version"]);
-  if (version.ok) {
-    add("Codex binary", "ok", `${version.said || "present"} at ${bin}`);
-  } else if (!version.ran) {
-    add(
-      "Codex binary",
-      "fail",
-      `${bin} could not be run: ${version.error.message}`,
-      `install the Codex CLI and put it on \`$PATH\`, or point \`$DELEGATE_CODEX_BIN\` at it.` +
-        " Every Delegation runs `codex exec`, so nothing can be delegated until it is there.",
-    );
-  } else {
-    add(
-      "Codex binary",
-      "fail",
-      `${bin} ${version.ended}: ${version.said}`,
-      `\`${bin} --version\` does not answer, so the binary is there and will not run. Reinstall the` +
-        " Codex CLI, or point `$DELEGATE_CODEX_BIN` at one that does.",
-    );
-  }
-
-  // The login, and what it is measured through: the Worker's filtered environment, because a
-  // credential that does not survive the allowlist is one the Worker does not have.
-  const keyName = ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"].find((name) => filled(process.env[name]));
-  if (!version.ran) {
-    add("Authentication", "warn", "not asked — there is no Codex binary to ask");
-  } else if (keyName) {
-    // Asking `codex login status` here would report no login and be beside the point: the key is
-    // what `codex exec` authenticates with, and it is on the allowlist, so the Worker has it.
-    add("Authentication", "ok", `$${keyName} is set and reaches the Worker`);
-  } else {
-    const login = askCodex(["login", "status"]);
-    if (login.ok) {
-      add("Authentication", "ok", login.said || "logged in");
-    } else {
-      add(
-        "Authentication",
-        "fail",
-        login.said || `codex login status ${login.ended}`,
-        "run `codex login` in a terminal, or set `$CODEX_API_KEY`. A Delegation with no login" +
-          " behind it fails at the provider — after the Budget was counted, because the Budget" +
-          " counts what was asked of it.",
-      );
-    }
-  }
-
-  // The precondition that kills `codex exec` at app-server startup, before any event and under
-  // every sandbox mode. Measured for every Delegation rather than only for a resumed one.
-  if (ensureWritable(home)) {
-    add("$CODEX_HOME", "ok", `${home} is writable`);
-  } else {
-    add(
-      "$CODEX_HOME",
-      "fail",
-      `$CODEX_HOME cannot be written to: ${home}`,
-      `add \`${home}\` to \`${ALLOW_WRITE}\` in your Claude Code settings. \`codex exec\` dies at` +
-        " app-server startup without it, before it emits a single event, `--ephemeral` or not — so" +
-        " no sandbox mode rescues it and it is a precondition for every Delegation, not only a" +
-        " resumed one.",
-    );
-  }
-
-  // The Ledger's directory. A Budget that cannot be counted cannot be enforced, and the Runner
-  // refuses every Delegation rather than running unbounded — so this is a hard failure here too.
-  if (ensureWritable(root)) {
-    add("State directory", "ok", `${root}, outside every repository`);
-  } else {
-    add(
-      "State directory",
-      "fail",
-      `the state directory cannot be written to: ${root}`,
-      `point \`$DELEGATE_STATE_DIR\` somewhere writable, or add \`${root}\` to \`${ALLOW_WRITE}\`.` +
-        " The Ledger is what the Delegation Budget is counted from, so the Runner refuses every" +
-        " Delegation rather than delegate unbounded.",
-    );
-  }
-
-  // Codex's own sandbox helper, on the one platform where its obstacle was measured.
-  const tmp = sandboxHelperTmp();
-  const helperReady = platform() !== "linux" || ensureWritable(tmp);
-  if (platform() !== "linux") {
-    add(
-      "Codex sandbox helper",
-      "ok",
-      `${tmp} is not probed on ${platform()} — the precondition is a Linux implementation detail`,
-    );
-  } else if (helperReady) {
-    add("Codex sandbox helper", "ok", `${tmp} is writable, so Codex's own sandbox can start`);
-  } else if (sandboxed) {
-    add(
-      "Codex sandbox helper",
-      "warn",
-      `${tmp} cannot be written to, so Delegations run \`-s ${SANDBOX_FALLBACK}\``,
-      `add \`${tmp}\` to \`${ALLOW_WRITE}\` to keep both sandboxes on. Codex's sandbox helper` +
-        " builds its mount targets there and panics without it, so the fallback is the only mode" +
-        " that runs — the outer sandbox is then the only layer enforcing anything, where two were" +
-        " available.",
-    );
-  } else {
-    add(
-      "Codex sandbox helper",
-      "fail",
-      `${tmp} cannot be written to, and no outer sandbox is holding anything`,
-      `allow writes to \`${tmp}\`. Codex's sandbox helper cannot start without it, and unsandboxed` +
-        ` \`-s ${SANDBOX_FALLBACK}\` would be the only thing between a third-party agent and this` +
-        " machine — so the Runner refuses the Delegation instead of taking that trade.",
-    );
-  }
-
-  // What a Delegation will actually be invoked with, said plainly: this is the flag the README has
-  // to explain, and a user reading a readiness report is owed the same honesty.
-  const modes = helperReady
-    ? "`read-only` for Advisory, `workspace-write` for Verifiable"
-    : `\`${SANDBOX_FALLBACK}\``;
-  if (!sandboxed) {
-    add("Outer sandbox", "ok", `none detected — Codex runs under its own sandbox: ${modes}`);
-  } else if (platform() === "darwin") {
-    add(
-      "Outer sandbox",
-      "warn",
-      `detected, and ADR-0004's conclusion is **unverified on this platform**`,
-      "ADR-0004 measured nesting on Linux and bubblewrap only, and the obstacle it found is an" +
-        " implementation detail of Codex's Linux sandbox helper — macOS pairs Seatbelt with" +
-        " Seatbelt, a different collision with no reason to behave alike. Delegations here take" +
-        ` the preferred path (${modes}), because two enforcing layers is the better guess to hold` +
-        " until it is measured, but it is a guess: watch for a Worker that reports success and" +
-        " writes nothing, and see issue #16.",
-    );
-  } else {
-    add(
-      "Outer sandbox",
-      "ok",
-      helperReady
-        ? `detected — Codex keeps its own sandbox as a second layer: ${modes}`
-        : `detected — it is the only layer, and Codex runs ${modes}`,
-    );
-  }
-
-  // The network, and only under an outer sandbox. Claude Code pre-allows no domains, so this is
-  // the precondition that turns into a timeout nobody can read. Unsandboxed there is nothing
-  // holding the connection, and telling an offline user to edit a sandbox setting would be wrong.
-  if (sandboxed) {
-    const endpoint = apiEndpoint();
-    const where = `${endpoint.host}:${endpoint.port}`;
-    const probe = await probeApiHost(endpoint);
-    if (probe.reachable) {
-      add("Provider network", "ok", `${where} answered`);
-    } else {
-      add(
-        "Provider network",
-        "warn",
-        `${where} did not answer: ${probe.detail}`,
-        `add \`${endpoint.host}\` to \`${ALLOWED_DOMAINS}\` in your Claude Code settings — it` +
-          " pre-allows no domains, so a sandboxed session reaches nothing it was not given. If" +
-          " your Codex config points at another provider, allow that host instead. Reported rather" +
-          " than failed: this probe is not the Worker, and a proxy it cannot see may still carry it.",
-      );
-    }
-  }
-
-  const state = budgetState(root, budgetLimits(settings));
-  if (state.exhausted) {
-    add(
-      "Delegation Budget",
-      "warn",
-      `spent: ${state.count} of ${state.ceiling} Delegations in the last ${state.windowHours}h`,
-      `nothing will be delegated until the window frees up${state.resets_at === null ? "" : ` at ${state.resets_at}`}.` +
-        " `/delegate:quota <n>` raises the ceiling if this window's work is worth it — that is the" +
-        " one place this bound is negotiable, and it is the user's to negotiate.",
-    );
-  } else {
-    add(
-      "Delegation Budget",
-      "ok",
-      `${state.count} of ${state.ceiling} in the last ${state.windowHours}h, ${state.remaining} left`,
-    );
-  }
-
-  process.stdout.write(renderReadiness({ checks, setup, root, settings, sources }));
-
-  const failures = checks.filter((check) => check.state === "fail");
-  if (failures.length > 0) {
-    // The whole report again, on stderr, remedies included. A harness may carry only one of the two
-    // channels — and the one this exists for is not the verdict but what to do about it, so the
-    // failing checks are repeated whole rather than named. Duplicated on purpose: a message
-    // printed twice costs a reader a second look, and a message printed on the channel nobody
-    // reads costs them the fix.
-    throw failed(
-      `delegation is not ready.\n${failures
-        .map((check) => `  ${check.label} — ${check.detail}${check.remedy === null ? "" : `\n    ${check.remedy}`}`)
-        .join("\n")}`,
-    );
-  }
 }
 
 async function main() {
